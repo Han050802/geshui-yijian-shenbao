@@ -11,6 +11,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -65,14 +66,35 @@ def load_config() -> dict:
     if not CONFIG_PATH.is_file():
         return {}
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"微信配对设置无法读取，请修复 {CONFIG_PATH}：{exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"微信配对设置必须是 JSON 对象：{CONFIG_PATH}")
+    for key in ("mapping_file", "company_name", "message"):
+        if key in data and not isinstance(data[key], str):
+            raise ValueError(f"微信配对设置 {key} 必须是文本：{CONFIG_PATH}")
+    return data
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def save_config(data: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(CONFIG_PATH, data)
 
 
 def parse_launch_args(argv: list[str]) -> tuple[bool, Path | None, Path | None]:
@@ -104,14 +126,13 @@ def load_company_file(path: Path | None) -> tuple[str, str]:
 
 
 def write_forward_result(path: Path, company: str, tax_label: str, sent_to: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "company": company,
         "taxLabel": tax_label,
         "sentTo": sent_to,
         "finishedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    _atomic_write_json(path, payload)
 
 
 class QueueLogHandler(logging.Handler):
@@ -155,6 +176,9 @@ class ReportApp(tk.Tk):
         result_file: Path | None = None,
         offline_self_test: bool = False,
     ) -> None:
+        # Invalid settings must fail before a window or automatic send exists;
+        # falling back could select an entirely different Excel workbook.
+        config = {} if offline_self_test else load_config()
         super().__init__()
         self.from_geshui = from_geshui
         self.company_file = company_file
@@ -168,6 +192,8 @@ class ReportApp(tk.Tk):
         self._closing = False
         self._close_when_idle = False
         self._job_kind = ""
+        self._automatic_start_cancelled = False
+        self._auto_send_after_id = None
         self.stop_event = threading.Event()
         self.running = False
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -178,7 +204,6 @@ class ReportApp(tk.Tk):
         self.minsize(800, 720)
         self.configure(bg="#f4f5f7")
 
-        config = {} if offline_self_test else load_config()
         self.mapping_var = tk.StringVar(value=str(mapping_path(str(config.get("mapping_file", "")))))
         self.company_var = tk.StringVar(value="" if from_geshui else str(config.get("company_name", "")))
         self.target_var = tk.StringVar(value="")
@@ -343,11 +368,12 @@ class ReportApp(tk.Tk):
         }
 
     def _save_clicked(self) -> None:
+        self._cancel_auto_send()
         if self.running:
             return
         try:
             save_config(self._settings())
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             messagebox.showerror("保存失败", str(exc), parent=self)
             return
         self.status_var.set("设置已保存。")
@@ -387,16 +413,19 @@ class ReportApp(tk.Tk):
             return False
 
     def _refresh_clicked(self) -> None:
+        self._cancel_auto_send()
         if not self.running and self._refresh_mapping():
             self._append_log("已重新读取 Excel 配对表。")
 
     def _select_mapping_path(self, path: Path) -> None:
+        self._cancel_auto_send()
         self.mapping_var.set(str(path))
         self.target_var.set("")
         save_config(self._settings())
         self._refresh_mapping()
 
     def _choose_mapping(self) -> None:
+        self._cancel_auto_send()
         if self.running:
             return
         value = filedialog.askopenfilename(parent=self, title="选择公司与微信群配对表",
@@ -408,6 +437,7 @@ class ReportApp(tk.Tk):
                 messagebox.showerror("选择失败", str(exc), parent=self)
 
     def _create_mapping(self) -> None:
+        self._cancel_auto_send()
         if self.running:
             return
         default = mapping_path(self.mapping_var.get())
@@ -423,6 +453,7 @@ class ReportApp(tk.Tk):
                 messagebox.showerror("新建失败", str(exc), parent=self)
 
     def _open_mapping(self) -> None:
+        self._cancel_auto_send()
         if self.running:
             return
         path = mapping_path(self.mapping_var.get())
@@ -450,6 +481,7 @@ class ReportApp(tk.Tk):
             self.send_button.configure(state="disabled")
 
     def _launch_job(self, kind: str, status: str, work, data: dict, hide: bool = False) -> bool:
+        self._cancel_auto_send()
         if self.running or self._closing or self._delivery_completed:
             return False
         self.running = True
@@ -492,8 +524,35 @@ class ReportApp(tk.Tk):
             self._append_log(message)
             return
         self._append_log(f"Excel 配对：{company} → {data['target_group']}")
+        if self._automatic_start_cancelled or self.running:
+            self.status_var.set("自动发送已暂停。请核对 Excel 配对后手动发送。")
+            return
         self.status_var.set(f"将发送到已配对群：{data['target_group']}")
-        self.after(800, self._send_clicked)
+        self._auto_send_after_id = self.after(800, lambda: self._run_auto_send(data))
+
+    def _cancel_auto_send(self) -> None:
+        self._automatic_start_cancelled = True
+        if self._auto_send_after_id is not None:
+            try:
+                self.after_cancel(self._auto_send_after_id)
+            except tk.TclError:
+                pass
+            self._auto_send_after_id = None
+
+    def _run_auto_send(self, expected: dict) -> None:
+        self._auto_send_after_id = None
+        if self._automatic_start_cancelled or self.running or self._closing:
+            return
+        try:
+            if self._form() != expected:
+                raise ValueError("配对或回执说明已变化，请核对后手动发送。")
+        except Exception as exc:
+            self._automatic_start_cancelled = True
+            message = f"自动发送已暂停：{exc}"
+            self.status_var.set(message)
+            self._append_log(message)
+            return
+        self._send_clicked()
 
     def _read_form(self) -> dict | None:
         try:
@@ -505,6 +564,7 @@ class ReportApp(tk.Tk):
             return None
 
     def _search_clicked(self) -> None:
+        self._cancel_auto_send()
         if self.running:
             return
         data = self._read_form()
@@ -534,6 +594,7 @@ class ReportApp(tk.Tk):
                 "expected_group": existing.group_name if existing else None}
 
     def _begin_pairing(self, wait: bool) -> None:
+        self._cancel_auto_send()
         if self.running:
             return
         try:
@@ -593,6 +654,7 @@ class ReportApp(tk.Tk):
             self.status_var.set("正在取消等待。")
 
     def _send_clicked(self) -> None:
+        self._cancel_auto_send()
         if self.running:
             return
         if self.from_geshui and self._delivery_attempted:
@@ -603,7 +665,7 @@ class ReportApp(tk.Tk):
             return
         try:
             save_config(self._settings())
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             messagebox.showerror("保存失败", str(exc), parent=self)
             return
         self._launch_job("send", f"正在截图并发送到已配对群：{data['target_group']}。请不要操作鼠标和键盘。",
@@ -639,7 +701,15 @@ class ReportApp(tk.Tk):
         current = GroupMappingStore(Path(data["mapping_file"])).resolve(data["company_name"])
         if current != data["target_group"]:
             raise RuntimeError("Excel 配对已发生变化，请刷新并核对后重试。没有发送。")
-        sent_to = report.execute_report(current, "", data["message"], before_send=self._mark_delivery_attempted)
+        def before_send() -> None:
+            # Capturing and searching can take seconds. Revalidate at the last
+            # boundary before the first message, not just before that work.
+            latest = GroupMappingStore(Path(data["mapping_file"])).resolve(data["company_name"])
+            if latest != current:
+                raise RuntimeError("Excel 配对已发生变化，请刷新并核对后重试。没有发送。")
+            self._mark_delivery_attempted()
+
+        sent_to = report.execute_report(current, "", data["message"], before_send=before_send)
         if sent_to != current:
             raise RuntimeError("微信回执目标与 Excel 配对不一致，请核对发送结果。")
         self._last_sent = sent_to
@@ -709,6 +779,7 @@ class ReportApp(tk.Tk):
         self.destroy()
 
     def _on_close(self) -> None:
+        self._cancel_auto_send()
         if self._closing:
             return
         if self.running:
@@ -721,7 +792,7 @@ class ReportApp(tk.Tk):
             return
         try:
             save_config(self._settings())
-        except OSError:
+        except (OSError, ValueError):
             pass
         self._close_after_send()
 
@@ -729,7 +800,14 @@ class ReportApp(tk.Tk):
 def main() -> None:
     from_geshui, company_file, result_file = parse_launch_args(sys.argv)
     enable_dpi()
-    app = ReportApp(from_geshui, company_file, result_file)
+    try:
+        app = ReportApp(from_geshui, company_file, result_file)
+    except (OSError, ValueError) as exc:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("微信配对设置错误", str(exc), parent=root)
+        root.destroy()
+        raise SystemExit(1) from exc
     app.mainloop()
     if from_geshui:
         raise SystemExit(app.exit_code)

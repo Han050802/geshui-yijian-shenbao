@@ -1,7 +1,10 @@
 """Offline Excel routing tests: temporary workbooks only, never WeChat or Excel UI."""
 
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
@@ -228,6 +231,56 @@ class GroupMappingTests(unittest.TestCase):
         self.assertTrue(book.active["C2"].value.startswith("="))
         book.close()
 
+    def test_last_formatted_column_does_not_create_invalid_excel_columns(self):
+        self.write_rows([], headers=list(mapping.HEADERS[:2]))
+        self.edit(lambda book: setattr(book.active["XFD1"], "font", Font(bold=True)))
+        self.store.upsert("甲公司", "甲群", notes="新备注")
+        book = load_workbook(self.path)
+        self.assertEqual(book.active.max_column, 16384)
+        self.assertEqual(book.active["C1"].value, "备注")
+        self.assertEqual(book.active["C2"].value, "新备注")
+        self.assertEqual(book.active["D1"].value, "更新时间")
+        self.assertTrue(book.active["XFD1"].font.bold)
+        book.close()
+
+    def test_far_corner_formatting_keeps_reads_and_new_rows_sparse(self):
+        self.write_rows([("甲公司", "甲群")], headers=list(mapping.HEADERS[:2]))
+        self.edit(lambda book: setattr(book.active["XFD1048576"], "font", Font(bold=True)))
+        book, sheet, _original = self.store._open()
+        try:
+            before = len(sheet._cells)
+            self.assertEqual([entry.company_name for _, entry in self.store._entries(sheet)], ["甲公司"])
+            self.assertEqual(len(sheet._cells), before)
+            self.assertEqual(self.store._first_empty_row(sheet), 3)
+            self.assertEqual(len(sheet._cells), before)
+        finally:
+            book.close()
+        self.store.upsert("乙公司", "乙群", notes="新登记")
+        book = load_workbook(self.path)
+        self.assertEqual(book.active["A3"].value, "乙公司")
+        self.assertEqual(book.active["B3"].value, "乙群")
+        self.assertTrue(book.active["XFD1048576"].font.bold)
+        self.assertEqual(book.active.max_column, 16384)
+        self.assertEqual(book.active.max_row, 1048576)
+        self.assertLess(len(book.active._cells), 20)
+        book.close()
+
+    def test_new_optional_column_preserves_data_below_blank_header(self):
+        self.write_rows([("甲公司", "甲群", "未命名列中的资料")], headers=list(mapping.HEADERS[:2]))
+        self.store.upsert("甲公司", "新群")
+        book = load_workbook(self.path)
+        self.assertIsNone(book.active["C1"].value)
+        self.assertEqual(book.active["C2"].value, "未命名列中的资料")
+        self.assertEqual(book.active["D1"].value, "更新时间")
+        book.close()
+
+    def test_no_optional_column_space_preserves_original_workbook(self):
+        self.write_rows([], headers=[*mapping.HEADERS[:2], *[f"占用列 {n}" for n in range(3, 16385)]])
+        original = self.path.read_bytes()
+        with self.assertRaisesRegex(mapping.MappingError, "没有可用的空白列"):
+            self.store.upsert("甲公司", "甲群")
+        self.assertEqual(self.path.read_bytes(), original)
+
     def test_extra_columns_formatting_formulas_and_other_sheets_survive(self):
         self.write_rows([("甲公司", "甲群", "批注", "负责人甲", "=1+1")], headers=[*mapping.HEADERS[:3], "负责人", "核算"])
         def setup(book):
@@ -319,6 +372,76 @@ class GroupMappingTests(unittest.TestCase):
             with self.assertRaisesRegex(mapping.MappingError, "其他程序修改"):
                 self.store.upsert("甲公司", "新群")
         self.assertEqual(self.path.read_bytes(), external)
+
+    def start_writer_paused_before_replace(self):
+        """A real second process holds the write transaction at its last step."""
+        ready, release = self.root / "writer-ready", self.root / "writer-release"
+        script = '''from pathlib import Path
+import sys, time
+from wechat import group_mapping as mapping
+path, ready, release = map(Path, sys.argv[1:])
+replace = mapping.os.replace
+def paused_replace(source, destination):
+    ready.touch()
+    deadline = time.monotonic() + 20
+    while not release.exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError("test writer was not released")
+        time.sleep(0.01)
+    return replace(source, destination)
+mapping.os.replace = paused_replace
+mapping.GroupMappingStore(path).upsert("甲公司", "甲群")
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(self.path), str(ready), str(release)],
+            cwd=Path(mapping.__file__).resolve().parents[1],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        def stop_writer():
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=10)
+        self.addCleanup(stop_writer)
+        deadline = time.monotonic() + 15
+        while not ready.exists():
+            if process.poll() is not None or time.monotonic() > deadline:
+                stop_writer()
+                self.fail("second process did not reach its workbook commit")
+            time.sleep(0.01)
+        return process, release
+
+    def test_concurrent_process_cannot_overwrite_successful_mapping(self):
+        self.store.create()
+        original = self.path.read_bytes()
+        process, release = self.start_writer_paused_before_replace()
+        # Equivalent path spellings must share a lock, and a different workbook
+        # must remain writable while this one has a pending transaction.
+        alias = self.path.parent / ".." / self.path.parent.name / self.path.name
+        with self.assertRaisesRegex(mapping.MappingError, "另一个任务正在保存"):
+            mapping.GroupMappingStore(alias).upsert("乙公司", "乙群")
+        self.assertEqual(self.path.read_bytes(), original)
+        independent = mapping.GroupMappingStore(self.root / "另一张配对表.xlsx")
+        independent.create()
+        independent.upsert("丙公司", "丙群")
+        release.touch()
+        output, errors = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.store.upsert("乙公司", "乙群")
+        self.assertEqual(
+            [(entry.company_name, entry.group_name) for entry in self.store.load()],
+            [("甲公司", "甲群"), ("乙公司", "乙群")],
+        )
+
+    def test_process_exit_releases_write_lock_without_manual_cleanup(self):
+        self.store.create()
+        process, _release = self.start_writer_paused_before_replace()
+        process.kill()
+        process.communicate(timeout=15)
+        # The interrupted write never replaced the workbook, and its OS lock
+        # cannot strand future registrations behind a stale lock file.
+        self.assertEqual(self.store.load(), [])
+        self.store.upsert("乙公司", "乙群")
+        self.assertEqual(self.store.resolve("乙公司"), "乙群")
 
     def test_external_creation_is_not_overwritten_by_template(self):
         actual_link = mapping.os.link

@@ -8,6 +8,7 @@ import ctypes
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
@@ -20,6 +21,7 @@ report = importlib.util.module_from_spec(SPEC)
 # call isolated, so importing this test module has no desktop side effects.
 with patch.object(ctypes, "windll", create=True):
     SPEC.loader.exec_module(report)
+REAL_SEND_TEXT_AND_IMAGE = report.send_text_and_image
 
 
 class OfflineTestCase(unittest.TestCase):
@@ -168,6 +170,30 @@ class SearchSelectionTests(OfflineTestCase):
             ("section", "群聊"), ("result", "示例公司财务群"), ("result", "示例公司财务群"),
         ], "示例公司财务群", None, exact=True, group_only=True, ambiguous=True)
 
+    def test_group_only_refuses_matching_row_when_more_groups_are_collapsed(self):
+        for kind in ("section", "result"):
+            for more in ("查看全部群聊", "查看更多", "更多群聊"):
+                with self.subTest(kind=kind, more=more):
+                    self.assert_selection([
+                        ("section", "群聊"), ("result", "示例公司财务群"), (kind, more),
+                    ], "示例公司财务群", None, exact=True, group_only=True, ambiguous=True)
+
+    def test_group_only_refuses_incomplete_declared_group_results(self):
+        for section in ("群聊(3)", "群聊（3）", "群聊3"):
+            with self.subTest(section=section):
+                self.assert_selection([
+                    ("section", section), ("result", "示例公司财务群"),
+                    ("result", "示例公司财务群旧群"),
+                ], "示例公司财务群", None, exact=True, group_only=True, ambiguous=True)
+
+    def test_group_only_accepts_complete_count_and_ignores_hidden_contacts(self):
+        self.assert_selection([
+            ("section", "联系人"), ("result", "示例公司财务群"),
+            ("section", "查看更多联系人"),
+            ("section", "群聊（2）"), ("result", "示例公司财务群"),
+            ("result", "示例公司财务群旧群"),
+        ], "示例公司财务群", 4, exact=True, group_only=True)
+
     def test_group_only_preserves_internal_spaces_and_punctuation(self):
         for expected, actual in (("A B", "AB"), ("AB", "A B"),
                                  ("A B", "A  B"), ("A-B", "A—B")):
@@ -240,6 +266,33 @@ class SearchSelectionTests(OfflineTestCase):
 
 
 class ChatTitleTests(OfflineTestCase):
+    def test_strict_ocr_cannot_treat_literal_numeric_suffix_as_member_decoration(self):
+        for actual, expected in (("财务群(2)", "财务群"),
+                                 ("财务群（ 2 ）", "财务群"),
+                                 ("财务群(2)", "财务群(2)"),
+                                 ("财务群(2)(5)", "财务群(2)")):
+            with self.subTest(actual=actual, expected=expected), patch.object(
+                report, "_read_control_chat_title", return_value=""
+            ), patch.object(report, "_read_screen_chat_title", return_value=actual):
+                self.assertFalse(report._chat_title_matches(Mock(), 123, expected, strict=True))
+
+    def test_strict_ocr_full_title_without_ambiguous_numeric_suffix_matches(self):
+        with patch.object(report, "_read_control_chat_title", return_value=""), patch.object(
+            report, "_read_screen_chat_title", return_value="A B 财务群"
+        ):
+            self.assertTrue(report._chat_title_matches(Mock(), 123, "A B 财务群", strict=True))
+
+    def test_strict_uia_title_keeps_numeric_suffix_as_part_of_real_group_name(self):
+        field = Mock(Name="财务群(2)")
+        field.Exists.return_value = True
+        root = Mock()
+        root.EditControl.return_value = field
+        auto = Mock()
+        auto.ControlFromHandle.return_value = root
+        with patch.dict(sys.modules, {"wxauto4.uia": SimpleNamespace(uiautomation=auto)}):
+            self.assertFalse(report._chat_title_matches(Mock(), 123, "财务群", strict=True))
+            self.assertTrue(report._chat_title_matches(Mock(), 123, "财务群(2)", strict=True))
+
     def assert_title(self, actual, selected, expected):
         wx = Mock()
         wx.ChatInfo.return_value = {"chat_name": actual}
@@ -334,9 +387,9 @@ class ChatTitleTests(OfflineTestCase):
     def test_strict_verification_reads_live_title_instead_of_cached_match(self):
         wx = Mock()
         wx.ChatInfo.return_value = {"chat_name": "A B"}
-        with patch.object(report, "_read_live_chat_title", return_value="AB") as read:
+        with patch.object(report, "_read_control_chat_title", return_value="AB") as read:
             self.assertFalse(report._chat_title_matches(wx, 123, "A B", strict=True))
-            read.assert_called_once_with(123, strict=True)
+            read.assert_called_once_with(123)
             wx.ChatInfo.assert_not_called()
 
     def test_strict_live_title_ocr_keeps_internal_spaces(self):
@@ -457,6 +510,12 @@ class DeliveryTests(OfflineTestCase):
             guard = patch.object(report, name)
             setattr(self, name, guard.start())
             self.addCleanup(guard.stop)
+        self.send_text_and_image.side_effect = self.simulated_send
+
+    @staticmethod
+    def simulated_send(*_args, before_send=None, **_kwargs):
+        if before_send:
+            before_send()
 
     def deliver(self):
         return report.deliver(self.wx, "本次说明", self.image, "示例公司财务群", "文件传输助手")
@@ -465,7 +524,10 @@ class DeliveryTests(OfflineTestCase):
         self.open_group.return_value = "示例公司财务群"
         self.assertEqual(self.deliver(), "示例公司财务群")
         self.open_group.assert_called_once_with(self.wx, "示例公司财务群", exact=True, group_only=True)
-        self.send_text_and_image.assert_called_once_with(self.wx, "本次说明", self.image)
+        self.send_text_and_image.assert_called_once_with(
+            self.wx, "本次说明", self.image, destination="示例公司财务群",
+            group_only=True, before_send=None,
+        )
         self.dismiss_search_box.assert_not_called()
 
     def test_target_miss_opens_fallback_with_exact_name_only(self):
@@ -475,13 +537,17 @@ class DeliveryTests(OfflineTestCase):
             call(self.wx, "示例公司财务群", exact=True, group_only=True), call(self.wx, "文件传输助手", exact=True),
         ])
         self.dismiss_search_box.assert_called_once_with()
-        self.send_text_and_image.assert_called_once_with(self.wx, "本次说明", self.image)
+        self.send_text_and_image.assert_called_once_with(
+            self.wx, "本次说明", self.image, destination="文件传输助手", before_send=None,
+        )
 
     def test_target_search_exception_can_use_verified_fallback(self):
         self.open_group.side_effect = [RuntimeError("offline search failure"), "文件传输助手"]
         self.assertEqual(self.deliver(), "文件传输助手")
         self.open_group.assert_called_with(self.wx, "文件传输助手", exact=True)
-        self.send_text_and_image.assert_called_once_with(self.wx, "本次说明", self.image)
+        self.send_text_and_image.assert_called_once_with(
+            self.wx, "本次说明", self.image, destination="文件传输助手", before_send=None,
+        )
 
     def test_no_target_and_no_fallback_never_sends(self):
         self.open_group.side_effect = ["", ""]
@@ -523,7 +589,10 @@ class DeliveryTests(OfflineTestCase):
     def test_before_send_runs_once_immediately_before_first_send(self):
         self.open_group.return_value = "示例公司财务群"
         sequence = []
-        self.send_text_and_image.side_effect = lambda *_args: sequence.append("send")
+        def send(*args, **kwargs):
+            self.simulated_send(*args, **kwargs)
+            sequence.append("send")
+        self.send_text_and_image.side_effect = send
         report.deliver(self.wx, "说明", self.image, "示例公司财务群", "",
                        before_send=lambda: sequence.append("attempted"))
         self.assertEqual(sequence, ["attempted", "send"])
@@ -559,11 +628,14 @@ class DeliveryTests(OfflineTestCase):
         before = Mock(side_effect=RuntimeError("record failed"))
         with self.assertRaisesRegex(RuntimeError, "record failed"):
             report.deliver(self.wx, "说明", self.image, "示例公司财务群", "", before_send=before)
-        self.send_text_and_image.assert_not_called()
+        before.assert_called_once_with()
 
     def test_sending_failure_keeps_attempt_marked_and_cannot_fallback(self):
         self.open_group.return_value = "示例公司财务群"
-        self.send_text_and_image.side_effect = RuntimeError("partial send")
+        def partial_send(*args, **kwargs):
+            self.simulated_send(*args, **kwargs)
+            raise RuntimeError("partial send")
+        self.send_text_and_image.side_effect = partial_send
         before = Mock()
         with self.assertRaisesRegex(RuntimeError, "partial send"):
             report.deliver(self.wx, "说明", self.image, "示例公司财务群", "文件传输助手",
@@ -598,6 +670,90 @@ class ExecuteBeforeSendTests(OfflineTestCase):
         ) as deliver:
             self.assertEqual(report.execute_report("A B", "", "说明", before_send=before), "A B")
         deliver.assert_called_once_with(wx, "说明", image, "A B", "", before_send=before)
+
+
+class DeliveryDestinationGuardTests(OfflineTestCase):
+    def setUp(self):
+        super().setUp()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.image = Path(directory.name) / "offline.png"
+        self.image.write_bytes(b"offline image placeholder")
+        self.wx = Mock(spec=["SendMsg", "SendFiles"])
+        self.wx.SendMsg.return_value = None
+        self.wx.SendFiles.return_value = None
+        self.group = "甲公司财务群"
+        self.current_title = self.group
+        self.before_send = Mock()
+        ctypes.windll.user32.GetForegroundWindow.return_value = 123
+        for name, kwargs in (
+            ("send_text_and_image", {"side_effect": REAL_SEND_TEXT_AND_IMAGE}),
+            ("open_group", {"return_value": self.group}),
+            ("find_wechat_main_window", {"return_value": (123, "wechat.exe")}),
+            ("_chat_title_matches", {"side_effect": lambda _wx, _hwnd, expected, **_kwargs:
+                self.current_title == expected}),
+        ):
+            guard = patch.object(report, name, **kwargs)
+            guard.start()
+            self.addCleanup(guard.stop)
+
+    def deliver(self, text="本次申报说明"):
+        return report.deliver(self.wx, text, self.image, self.group, "",
+                              before_send=self.before_send)
+
+    def test_switch_during_pre_send_delay_stops_before_first_message(self):
+        def switch(_seconds):
+            self.current_title = "乙公司财务群"
+        report.time.sleep.side_effect = switch
+        with self.assertRaisesRegex(RuntimeError, "会话.*变化"):
+            self.deliver()
+        self.wx.SendMsg.assert_not_called()
+        self.wx.SendFiles.assert_not_called()
+        self.before_send.assert_not_called()
+
+    def test_switch_between_text_and_image_stops_image_without_resending_text(self):
+        def switch(seconds):
+            if seconds == report.BETWEEN_SEND_SECONDS:
+                self.current_title = "乙公司财务群"
+        report.time.sleep.side_effect = switch
+        with self.assertRaisesRegex(RuntimeError, "会话.*变化"):
+            self.deliver()
+        self.wx.SendMsg.assert_called_once_with("本次申报说明")
+        self.wx.SendFiles.assert_not_called()
+        self.before_send.assert_called_once_with()
+
+    def test_lost_foreground_before_image_only_send_stops_without_attempt_marker(self):
+        def lose_focus(_seconds):
+            ctypes.windll.user32.GetForegroundWindow.return_value = 999
+        report.time.sleep.side_effect = lose_focus
+        with self.assertRaisesRegex(RuntimeError, "微信.*前台"):
+            self.deliver(text="")
+        self.wx.SendMsg.assert_not_called()
+        self.wx.SendFiles.assert_not_called()
+        self.before_send.assert_not_called()
+
+    def test_valid_destination_sends_text_and_image_and_marks_attempt_once(self):
+        self.assertEqual(self.deliver(), self.group)
+        self.wx.SendMsg.assert_called_once_with("本次申报说明")
+        self.wx.SendFiles.assert_called_once_with(str(self.image.resolve()))
+        self.before_send.assert_called_once_with()
+
+    def test_switch_while_before_send_callback_reads_excel_stops_actual_send(self):
+        def switch():
+            self.current_title = "乙公司财务群"
+        self.before_send.side_effect = switch
+        with self.assertRaisesRegex(RuntimeError, "会话.*变化"):
+            self.deliver()
+        self.wx.SendMsg.assert_not_called()
+        self.wx.SendFiles.assert_not_called()
+        self.before_send.assert_called_once_with()
+
+    def test_callback_failure_never_enters_wechat_send_api(self):
+        self.before_send.side_effect = RuntimeError("Excel 已变化")
+        with self.assertRaisesRegex(RuntimeError, "Excel 已变化"):
+            self.deliver()
+        self.wx.SendMsg.assert_not_called()
+        self.wx.SendFiles.assert_not_called()
 
 
 if __name__ == "__main__":

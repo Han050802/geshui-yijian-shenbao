@@ -142,6 +142,16 @@ class RuntimeSelfTestTests(unittest.TestCase):
         self.assertEqual(self.report()["bundled_browser"], "failed")
         self.engine.chromium.launch_persistent_context.assert_not_called()
 
+    def test_main_runtime_missing_excel_dependency_stops_before_desktop_checks(self):
+        with patch.object(runtime_checks, "_check_excel_mapping", side_effect=ImportError("missing Excel dependency")):
+            self.assertEqual(runtime_checks.run_self_test(self.base), 1)
+        result = self.report()
+        self.assertEqual(result["failed_check"], "excel_mapping")
+        self.assertEqual(result["excel_mapping"], "failed")
+        self.assertEqual(result["ocr_models"], "not_run")
+        self.ocr.RapidOCR.assert_not_called()
+        self.tk.Tk.assert_not_called()
+
     def test_existing_browser_outside_package_is_rejected(self):
         host_executable = self.base / "host-chrome.exe"
         host_executable.write_bytes(b"fake host browser")
@@ -185,3 +195,4 @@ class RuntimeSelfTestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

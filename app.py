@@ -121,9 +121,10 @@ def wechat_mapping_store():
                 raise ValueError()
         except (OSError, ValueError) as exc:
             raise ValidationError("微信设置无法读取，请先打开‘微信群与Excel配对’检查设置。") from exc
-    value = config.get("mapping_file") or "data/微信群配对.xlsx"
+    value = config.get("mapping_file", "")
     if not isinstance(value, str):
         raise ValidationError("微信Excel路径格式错误，请重新选择配对表。")
+    value = value or "data/微信群配对.xlsx"
     path = Path(value)
     try:
         return GroupMappingStore(path if path.is_absolute() else BASE / path)

@@ -59,7 +59,7 @@ def main() -> int:
                 }
                 if name == "main":
                     passed = all(result.get(k) == "ok" for k in
-                                 ("imports", "ocr_models", "tkinter", "bundled_browser"))
+                                 ("imports", "excel_mapping", "ocr_models", "tkinter", "bundled_browser"))
                 elif name == "wechat":
                     passed = result.get("ok") is True
                 else:
@@ -82,3 +82,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

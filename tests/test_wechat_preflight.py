@@ -100,6 +100,27 @@ class WeChatPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "xlsx"):
             app.wechat_mapping_store()
 
+    def test_false_non_string_path_never_silently_uses_default_workbook(self):
+        self.pair()
+        config = self.base / "wechat/config.json"
+        config.parent.mkdir()
+        for invalid in (None, False, 0, [], {}):
+            with self.subTest(path=invalid):
+                config.write_text(json.dumps({"mapping_file": invalid}), encoding="utf-8")
+                with self.assertRaisesRegex(ValidationError, "路径格式"):
+                    app.wechat_mapping_store()
+
+    def test_bom_config_keeps_selected_external_workbook(self):
+        self.pair(group="默认表群名")
+        external = self.base / "财务部门" / "外部表.xlsx"
+        mapping = GroupMappingStore(external)
+        mapping.create()
+        mapping.upsert(self.company.name, "所选外部表群名")
+        config = self.base / "wechat/config.json"
+        config.parent.mkdir()
+        config.write_text(json.dumps({"mapping_file": str(external)}), encoding="utf-8-sig")
+        self.assertEqual(app.wechat_mapping_store().resolve(self.company.name), "所选外部表群名")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -77,6 +77,8 @@ class UIHarness(SimpleNamespace):
         self._busy_widgets = [self.send_button]
         self.running = False
         self._job_kind = ""
+        self._automatic_start_cancelled = False
+        self._auto_send_after_id = None
         self._last_sent = ""
         self._delivery_attempted = False
         self._delivery_completed = False
@@ -91,6 +93,7 @@ class UIHarness(SimpleNamespace):
         self._append_log = Mock()
         self._start_worker = Mock()
         self.after = Mock()
+        self.after_cancel = Mock()
         self.deiconify = Mock()
         self.lift = Mock()
         self.attributes = Mock()
@@ -162,6 +165,63 @@ class ExcelUITests(unittest.TestCase):
         self.assertEqual(config["extra"], 7)
         self.assertEqual(config["company_name"], "甲公司")
 
+    def test_config_reads_utf8_bom_without_losing_external_workbook(self):
+        config = self.base / "config.json"
+        config.write_text(json.dumps({"mapping_file": str(self.path)}), encoding="utf-8-sig")
+        with patch.object(ui, "CONFIG_PATH", config):
+            self.assertEqual(ui.load_config()["mapping_file"], str(self.path))
+
+    def test_corrupt_config_never_silently_defaults_to_another_workbook(self):
+        config = self.base / "config.json"
+        with patch.object(ui, "CONFIG_PATH", config):
+            for content in ('{"mapping_file":', '[]', 'null', '"配对表"'):
+                with self.subTest(content=content):
+                    config.write_text(content, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        ui.load_config()
+
+    def test_non_text_mapping_config_is_rejected_even_when_falsey(self):
+        config = self.base / "config.json"
+        with patch.object(ui, "CONFIG_PATH", config):
+            for value in (None, 0, False, [], {}, 123):
+                with self.subTest(value=value):
+                    config.write_text(json.dumps({"mapping_file": value}), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "mapping_file"):
+                        ui.load_config()
+
+    def test_default_config_is_allowed_only_when_missing_or_explicitly_empty(self):
+        config = self.base / "config.json"
+        with patch.object(ui, "CONFIG_PATH", config):
+            self.assertEqual(ui.load_config(), {})
+            config.write_text('{"mapping_file":""}', encoding="utf-8")
+            self.assertEqual(ui.load_config(), {"mapping_file": ""})
+
+    def test_atomic_config_failure_preserves_previous_settings(self):
+        config = self.base / "config.json"
+        original = json.dumps({"mapping_file": str(self.path)})
+        config.write_text(original, encoding="utf-8")
+        with patch.object(ui, "CONFIG_PATH", config), patch.object(ui.os, "replace", side_effect=OSError("磁盘错误")):
+            with self.assertRaises(OSError):
+                ui.save_config({"mapping_file": "其他.xlsx"})
+        self.assertEqual(config.read_text(encoding="utf-8"), original)
+        self.assertEqual(list(self.base.glob(".config.json.*.tmp")), [])
+
+    def test_atomic_receipt_failure_preserves_previous_valid_receipt(self):
+        result = self.base / "receipt.json"
+        ui.write_forward_result(result, "甲公司", "2026年10月", "财税核对群")
+        original = result.read_bytes()
+        with patch.object(ui.os, "replace", side_effect=OSError("磁盘错误")):
+            with self.assertRaises(OSError):
+                ui.write_forward_result(result, "乙公司", "2026年10月", "其他群")
+        self.assertEqual(result.read_bytes(), original)
+        self.assertEqual(list(self.base.glob(".receipt.json.*.tmp")), [])
+
+    def test_config_corrupted_after_launch_prevents_send_with_visible_error(self):
+        with patch.object(ui, "load_config", side_effect=ValueError("配置损坏")):
+            self.app._send_clicked()
+        self.app._start_worker.assert_not_called()
+        self.dialogs.showerror.assert_called_once()
+
     def test_default_mapping_path_follows_program_root(self):
         with patch.object(ui, "APP_ROOT", self.base):
             self.assertEqual(ui.mapping_path(), self.base / "data" / "微信群配对.xlsx")
@@ -178,7 +238,10 @@ class ExcelUITests(unittest.TestCase):
         self.app.company_file.write_text(json.dumps({"company": "甲公司", "taxLabel": "2026年10月"}), encoding="utf-8")
         self.app._start_from_geshui()
         self.assertEqual(self.app.target_var.get(), "财税核对群")
-        self.app.after.assert_called_once_with(800, self.app._send_clicked)
+        self.assertEqual(self.app.after.call_args.args[0], 800)
+        with patch.object(ui, "save_config"):
+            self.app.after.call_args.args[1]()
+        self.app._start_worker.assert_called_once()
 
     def test_from_geshui_unmapped_stays_open_for_repair(self):
         self.app.from_geshui = True
@@ -193,8 +256,79 @@ class ExcelUITests(unittest.TestCase):
         self.app._finish = Mock()
         fake_report.execute_report.return_value = "财税核对群"
         self.app._capture_and_send(self.form())
-        fake_report.execute_report.assert_called_once_with("财税核对群", "", "已完成申报", before_send=self.app._mark_delivery_attempted)
+        self.assertEqual(fake_report.execute_report.call_args.args, ("财税核对群", "", "已完成申报"))
+        fake_report.execute_report.call_args.kwargs["before_send"]()
+        self.assertTrue(self.app._delivery_attempted)
         self.assertEqual(self.app._last_sent, "财税核对群")
+
+    def test_mapping_changed_during_wechat_search_stops_before_first_message(self):
+        sent = []
+        def execute(*args, **kwargs):
+            self.store.upsert("甲公司", "搜索期间改成的新群")
+            kwargs["before_send"]()
+            sent.append(args[0])
+            return args[0]
+        fake_report.execute_report.side_effect = execute
+        with self.assertRaisesRegex(RuntimeError, "发生变化"):
+            self.app._capture_and_send(self.form())
+        self.assertEqual(sent, [])
+        self.assertFalse(self.app._delivery_attempted)
+
+    def test_workbook_removed_during_wechat_search_stops_before_first_message(self):
+        sent = []
+        def execute(*args, **kwargs):
+            self.path.unlink()
+            kwargs["before_send"]()
+            sent.append(args[0])
+            return args[0]
+        fake_report.execute_report.side_effect = execute
+        with self.assertRaises(ValueError):
+            self.app._capture_and_send(self.form())
+        self.assertEqual(sent, [])
+        self.assertFalse(self.app._delivery_attempted)
+
+    def test_search_only_cancels_pending_automatic_send(self):
+        self.app.from_geshui = True
+        self.app.company_file.write_text(json.dumps({"company": "甲公司"}), encoding="utf-8")
+        self.app._start_from_geshui()
+        callback = self.app.after.call_args.args[1]
+        self.app._search_clicked()
+        self.assertEqual(self.app._job_kind, "search")
+        self.app._finish(True, "找到群")
+        self.app.ui_queue.get_nowait()()
+        with patch.object(ui, "save_config"):
+            callback()  # Even a callback already queued must not send.
+        self.assertEqual(self.app._start_worker.call_count, 1)
+        self.app.after_cancel.assert_called_once()
+        fake_report.execute_report.assert_not_called()
+
+    def test_opening_file_picker_cancels_before_modal_dialog(self):
+        self.app._auto_send_after_id = "timer-1"
+        def choose(**kwargs):
+            self.app.after_cancel.assert_called_once_with("timer-1")
+            return ""
+        with patch.object(ui.filedialog, "askopenfilename", side_effect=choose):
+            self.app._choose_mapping()
+        self.assertTrue(self.app._automatic_start_cancelled)
+
+    def test_explicit_action_before_automatic_start_prevents_later_timer(self):
+        self.app.from_geshui = True
+        self.app.company_file.write_text(json.dumps({"company": "甲公司"}), encoding="utf-8")
+        self.app._check_clicked()
+        self.app.running = False
+        self.app._start_from_geshui()
+        self.app.after.assert_not_called()
+        self.assertIn("暂停", self.app.status_var.get())
+
+    def test_automatic_timer_rejects_changed_pairing_snapshot(self):
+        self.app.from_geshui = True
+        self.app.company_file.write_text(json.dumps({"company": "甲公司"}), encoding="utf-8")
+        self.app._start_from_geshui()
+        callback = self.app.after.call_args.args[1]
+        self.store.upsert("甲公司", "自动等待期间修改的群")
+        callback()
+        self.app._start_worker.assert_not_called()
+        self.assertIn("暂停", self.app.status_var.get())
 
     def test_mapping_change_after_button_click_prevents_send(self):
         data = self.form()

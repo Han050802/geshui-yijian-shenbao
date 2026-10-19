@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 
-CHECK_NAMES = ("imports", "ocr_models", "tkinter", "bundled_browser")
+CHECK_NAMES = ("imports", "excel_mapping", "ocr_models", "tkinter", "bundled_browser")
 OFFLINE_TITLE = "TaxZero offline self-test"
 OFFLINE_HTML = (
     "<!doctype html><html><head><meta charset='utf-8'>"
@@ -79,11 +79,24 @@ def _write_self_test_report(base: Path, result: dict) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _check_excel_mapping() -> None:
+    """Verify the main runtime's Excel preflight dependency using temporary data."""
+    from wechat.group_mapping import GroupMappingStore
+
+    with tempfile.TemporaryDirectory(prefix="taxzero-excel-self-test-") as temporary:
+        store = GroupMappingStore(Path(temporary) / "配对检查.xlsx")
+        store.create()
+        store.upsert("离线自检公司", "离线自检群", expected_group=None)
+        if store.resolve("离线自检公司") != "离线自检群":
+            raise RuntimeError("Excel mapping check failed")
+
+
 def run_self_test(base: str | Path) -> int:
     """Return 0 only when the packaged dependencies, GUI and browser all work.
 
     No business settings, tax records, existing browser profile or WeChat
-    modules are loaded. Exceptions are reduced to their type in the report.
+    automation modules are loaded. Excel uses a temporary workbook only.
+    Exceptions are reduced to their type in the report.
     """
     result = {name: "not_run" for name in CHECK_NAMES}
     current = "imports"
@@ -98,6 +111,9 @@ def run_self_test(base: str | Path) -> int:
         from playwright.sync_api import sync_playwright
 
         result["imports"] = "ok"
+        current = "excel_mapping"
+        _check_excel_mapping()
+        result["excel_mapping"] = "ok"
         current = "ocr_models"
         engine = rapidocr_onnxruntime.RapidOCR(
             intra_op_num_threads=2, inter_op_num_threads=2,
@@ -129,3 +145,4 @@ def run_self_test(base: str | Path) -> int:
         # A missing/unwritable report cannot be reported as a successful check.
         return 1
     return exit_code
+

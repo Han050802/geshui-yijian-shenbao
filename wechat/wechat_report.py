@@ -516,6 +516,29 @@ def _search_section(name: str) -> str:
     return name
 
 
+def _declared_group_count(name: str) -> int:
+    match = re.fullmatch(r"群聊[（(]?(\d+)[）)]?", _normalized_name(name))
+    return int(match.group(1)) if match else 0
+
+
+def _is_more_group_results(name: str, section: str) -> bool:
+    text = _normalized_name(name)
+    if not text.startswith(("查看全部", "查看更多", "更多")):
+        return False
+    return "群聊" in text or (section == "群聊" and bool(re.fullmatch(
+        r"(?:查看全部|查看更多|更多)(?:[（(]?\d+[）)]?)?", text
+    )))
+
+
+def _check_group_results_complete(candidates, declared_count: int, has_more: bool) -> None:
+    visible_count = sum(section == "群聊" for section, _name, _item in candidates)
+    if has_more or declared_count > visible_count:
+        raise AmbiguousChatError(
+            "微信群搜索结果尚未完整展开，无法排除隐藏的同名群。"
+            "请展开全部群聊结果，或调整为唯一的完整群名后重试。"
+        )
+
+
 def _choose_chat_result(candidates, group_name: str, *, exact: bool = False,
                         group_only: bool = False):
     """选择唯一会话；正式目标必须完整匹配且明确位于「群聊」分类。"""
@@ -554,15 +577,22 @@ def _search_result_to_click(root, group_name: str, *, exact: bool = False,
         return None
     section = ""
     candidates = []
+    declared_count = 0
+    has_more = False
     for item in search_list.GetChildren():
         name = (item.Name or "").strip()
         class_name = item.ClassName or ""
+        if _is_more_group_results(name, section):
+            has_more = True
         if class_name == "mmui::XTableCell":
             section = _search_section(name)
+            declared_count += _declared_group_count(name)
             continue
         if class_name != "mmui::SearchContentCellView":
             continue
         candidates.append((section, name, item))
+    if group_only:
+        _check_group_results_complete(candidates, declared_count, has_more)
     return _choose_chat_result(candidates, group_name, exact=exact, group_only=group_only)
 
 
@@ -572,16 +602,23 @@ def _result_to_click(lines: list[dict], group_name: str, search_bottom: int,
     """只从左侧搜索结果的会话分类中选取名称，不匹配聊天记录。"""
     section = ""
     candidates = []
+    declared_count = 0
+    has_more = False
     for line in sorted(lines, key=lambda item: item["y"]):
         if line["bottom"] <= search_bottom + 8:
             continue
         if search_right is not None and line["x"] >= search_right:
             continue
         text = _search_section(line["text"])
+        if _is_more_group_results(line["text"], section):
+            has_more = True
         if text in _CHAT_SECTIONS or text in _SKIP_SECTIONS or text.startswith("查看全部"):
             section = "聊天记录" if text.startswith("查看全部") else text
+            declared_count += _declared_group_count(line["text"])
             continue
         candidates.append((section, line["text"], line))
+    if group_only:
+        _check_group_results_complete(candidates, declared_count, has_more)
     return _choose_chat_result(candidates, group_name, exact=exact, group_only=group_only)
 
 
@@ -602,8 +639,19 @@ def _chat_title_matches(wx, hwnd: int, group_name: str, *, strict: bool = False)
     if strict:
         # New Excel destinations require a fresh title, not ChatInfo's cached
         # previous conversation, and internal whitespace is meaningful.
-        actual = _read_live_chat_title(hwnd, strict=True)
-        return _same_chat_title(actual, group_name, strict=True)
+        actual = _read_control_chat_title(hwnd)
+        if actual:
+            # The input control exposes the conversation name itself. A final
+            # "(2)" here is part of that name, not the header's member count.
+            return actual == group_name.strip()
+        actual = _read_screen_chat_title(hwnd, strict=True)
+        # In a rendered header, "财务群(2)" could mean either that literal
+        # group name or the group "财务群" with two members. OCR alone cannot
+        # prove which it is, including when the expected name ends in digits.
+        if re.search(r"\s*[（(]\s*\d+\s*[）)]$", actual.strip()):
+            logger.warning("标题包含无法区分的数字后缀，需通过微信控件核验完整群名：%s", actual)
+            return False
+        return actual.strip() == group_name.strip()
     actual = _safe_chat_name(wx)
     if _same_chat_title(actual, group_name):
         return True
@@ -813,21 +861,28 @@ class GroupWaitCancelled(RuntimeError):
     """用户取消等待微信群出现，调用方不得写入 Excel。"""
 
 
-def _read_live_chat_title(hwnd: int, *, strict: bool = False) -> str:
-    """只读取当前可见会话标题，不使用可能缓存旧名称的 ChatInfo。"""
+def _read_control_chat_title(hwnd: int) -> str:
+    """读取输入框暴露的原始群名；它不包含标题栏另加的成员人数。"""
     try:
         from wxauto4.uia import uiautomation as auto
 
-        title = _current_chat_title(auto.ControlFromHandle(hwnd))
-        if title:
-            return title
+        return _current_chat_title(auto.ControlFromHandle(hwnd))
     except Exception:
         logger.debug("无法从控件读取实时会话标题，尝试可见标题", exc_info=True)
+        return ""
+
+
+def _read_screen_chat_title(hwnd: int, *, strict: bool = False) -> str:
     image, _left, _top = _capture_wechat(hwnd)
     header = image.crop((int(image.width * 0.36), 28, int(image.width * 0.78), 92))
     kwargs = {"preserve_spacing": True} if strict else {}
     separator = "\n" if strict else ""
     return separator.join(line["text"] for line in _ocr_lines(header, **kwargs))
+
+
+def _read_live_chat_title(hwnd: int, *, strict: bool = False) -> str:
+    """只读取当前可见会话标题，不使用可能缓存旧名称的 ChatInfo。"""
+    return _read_control_chat_title(hwnd) or _read_screen_chat_title(hwnd, strict=strict)
 
 
 def wait_for_group(group_name: str, stop_event, on_status=None, timeout=600) -> str:
@@ -891,9 +946,8 @@ def deliver(wx, text: str, image_path: Path, target_group: str, fallback_group: 
         opened = ""
 
     if opened:
-        if before_send is not None:
-            before_send()
-        send_text_and_image(wx, text, image_path)
+        send_text_and_image(wx, text, image_path, destination=opened,
+                            group_only=True, before_send=before_send)
         return opened
 
     if not fallback_group.strip():
@@ -911,9 +965,8 @@ def deliver(wx, text: str, image_path: Path, target_group: str, fallback_group: 
     if not fallback_opened:
         raise RuntimeError(f"目标群与兜底群都无法打开: {target_group} / {fallback_group}")
 
-    if before_send is not None:
-        before_send()
-    send_text_and_image(wx, text, image_path)
+    send_text_and_image(wx, text, image_path, destination=fallback_opened,
+                        before_send=before_send)
     return fallback_opened
 
 
@@ -931,19 +984,45 @@ def build_message(summary: str) -> str:
     return summary.strip()
 
 
-def send_text_and_image(wx, text: str, image_path: Path) -> None:
-    """先发文字，再发本地截图。两次发送之间留出渲染间隔。"""
+def _confirm_send_destination(wx, destination: str, *, group_only: bool) -> None:
+    found = find_wechat_main_window()
+    if found is None or ctypes.windll.user32.GetForegroundWindow() != found[0]:
+        raise RuntimeError("微信已不在前台，已停止发送。请确认目标群后重新操作。")
+    if not _chat_title_matches(wx, found[0], destination, strict=group_only):
+        raise RuntimeError(f"当前会话已变化或无法确认「{destination}」，已停止发送。")
+
+
+def send_text_and_image(wx, text: str, image_path: Path, *, destination: str = "",
+                        group_only: bool = False, before_send=None) -> None:
+    """文字和截图各自发送前再次检查当前会话，首次实际发送前登记尝试。"""
     image_path = image_path.resolve()
     if not image_path.is_file():
         raise FileNotFoundError(f"截图不存在: {image_path}")
 
     time.sleep(BEFORE_SEND_SECONDS)
+    attempted = False
+
+    def prepare_send():
+        nonlocal attempted
+        if destination:
+            _confirm_send_destination(wx, destination, group_only=group_only)
+        if not attempted:
+            if before_send is not None:
+                before_send()
+                # The callback rereads Excel and may persist a receipt. The
+                # user can switch chats while that I/O is in progress.
+                if destination:
+                    _confirm_send_destination(wx, destination, group_only=group_only)
+            attempted = True
+
     if text.strip():
+        prepare_send()
         msg_result = wx.SendMsg(text.strip())
         if _is_explicit_failure(msg_result):
             raise RuntimeError(f"文字发送失败: {msg_result}")
         logger.info("文字已发送")
         time.sleep(BETWEEN_SEND_SECONDS)
+    prepare_send()
     file_result = wx.SendFiles(str(image_path))
     if _is_explicit_failure(file_result):
         raise RuntimeError(f"截图发送失败: {file_result}")

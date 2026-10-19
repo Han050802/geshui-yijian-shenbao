@@ -6,6 +6,7 @@ connect to WeChat, or infer a destination when an Excel entry is missing.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -76,7 +77,7 @@ class GroupMappingStore:
 
     def create(self) -> Path:
         """Create an empty template, or validate an existing file without changing it."""
-        with _WRITE_LOCK:
+        with _WRITE_LOCK, self._process_write_lock():
             if self.path.exists():
                 self.list_entries()
                 return self.path
@@ -139,7 +140,7 @@ class GroupMappingStore:
             or any(ord(char) < 32 and char not in "\t\n\r" for char in notes)
         ):
             raise MappingError("备注必须是有效的文本。")
-        with _WRITE_LOCK:
+        with _WRITE_LOCK, self._process_write_lock():
             self._check_excel_lock()
             workbook, sheet, original = self._open(for_write=True)
             try:
@@ -164,11 +165,9 @@ class GroupMappingStore:
                     row = self._first_empty_row(sheet)
                 columns = self._optional_columns(sheet)
                 if notes is not None and "备注" not in columns:
-                    columns["备注"] = sheet.max_column + 1
-                    sheet.cell(1, columns["备注"], "备注")
+                    columns["备注"] = self._add_optional_column(sheet, "备注")
                 if "更新时间" not in columns:
-                    columns["更新时间"] = sheet.max_column + 1
-                    sheet.cell(1, columns["更新时间"], "更新时间")
+                    columns["更新时间"] = self._add_optional_column(sheet, "更新时间")
                 self._set_text(sheet.cell(row, 1), company_name)
                 self._set_text(sheet.cell(row, 2), group_name)
                 if notes is not None:
@@ -234,20 +233,48 @@ class GroupMappingStore:
             raise MappingError("无法打开微信群配对表，请确认它是未损坏、未加密的 .xlsx 工作簿。") from exc
 
     @staticmethod
+    def _populated_cells(sheet):
+        # openpyxl is pinned to 3.1.5. Its public row/column iterators materialize
+        # every missing cell up to max_row/max_column, including formatting at
+        # XFD1048576. Read a snapshot of the existing sparse cell storage here;
+        # never mutate it. All writes below still use the public cell API.
+        return tuple(cell for cell in tuple(sheet._cells.values()) if cell.value is not None)
+
+    @staticmethod
     def _optional_columns(sheet) -> dict[str, int]:
         columns = {}
-        for cell in sheet[1]:
-            if cell.value in HEADERS[2:]:
+        for cell in GroupMappingStore._populated_cells(sheet):
+            if cell.row == 1 and cell.value in HEADERS[2:]:
                 if cell.value in columns:
                     raise MappingError(f"Excel 表头“{cell.value}”重复，请保留唯一列后重试。")
                 columns[cell.value] = cell.column
         return columns
 
+    @staticmethod
+    def _add_optional_column(sheet, header: str) -> int:
+        # Formatting alone can extend max_column to Excel's last column XFD.
+        # Appending after max_column would then create an invalid XFE column.
+        # Reuse a column only when all its cells are empty, preserving extra
+        # columns whose header is blank but whose data is still meaningful.
+        occupied = {cell.column for cell in GroupMappingStore._populated_cells(sheet)}
+        for column in range(3, 16385):
+            if column not in occupied:
+                sheet.cell(1, column, header)
+                return column
+        raise MappingError(
+            "配对工作表没有可用的空白列，无法添加备注或更新时间。"
+            "请整理空白列或把配对数据复制到新建配对表；原文件未修改。"
+        )
+
     def _entries(self, sheet) -> list[tuple[int, GroupMappingEntry]]:
         columns = self._optional_columns(sheet)
         entries = []
         seen = {}
-        for row in range(2, sheet.max_row + 1):
+        rows = sorted({
+            cell.row for cell in self._populated_cells(sheet)
+            if cell.row >= 2 and cell.column in (1, 2)
+        })
+        for row in rows:
             company_cell, group_cell = sheet.cell(row, 1), sheet.cell(row, 2)
             if company_cell.value is None and group_cell.value is None:
                 continue
@@ -274,10 +301,13 @@ class GroupMappingStore:
         # Formatting can make max_row thousands of rows longer than the actual
         # table. Reuse the first entirely empty data row, retaining notes-only
         # rows and any other cells containing values outside the mapping columns.
-        for cells in sheet.iter_rows(min_row=2):
-            if all(cell.value is None for cell in cells):
-                return cells[0].row
-        return max(2, sheet.max_row + 1)
+        occupied = {cell.row for cell in GroupMappingStore._populated_cells(sheet)}
+        row = 2
+        while row in occupied:
+            row += 1
+        if row > 1048576:
+            raise MappingError("配对工作表没有可用的空白行，请整理数据或新建配对表；原文件未修改。")
+        return row
 
     @staticmethod
     def _check_preservable(original: bytes) -> None:
@@ -300,6 +330,40 @@ class GroupMappingStore:
     def _check_excel_lock(self) -> None:
         if self.path.with_name("~$" + self.path.name).exists():
             raise MappingError("微信群配对表正在 Excel 中打开，请先保存并关闭 Excel，再保存配对。")
+
+    @contextmanager
+    def _process_write_lock(self):
+        # The byte comparison in _save detects edits by Excel, but is not an
+        # atomic compare-and-swap: two app processes could both pass it before
+        # either replaces the workbook. Lock the entire read/edit/replace cycle.
+        # Keep the lock file in the OS temp directory and never unlink it:
+        # unlinking a locked file would let another process lock a new inode.
+        identity = os.path.normcase(str(self.path.resolve()))
+        lock_name = "geshui-excel-" + sha256(identity.encode("utf-8")).hexdigest() + ".lock"
+        try:
+            stream = (Path(tempfile.gettempdir()) / lock_name).open("a+b")
+        except OSError as exc:
+            raise MappingError("无法取得配对表写入锁，请检查临时文件夹写入权限后重试。") from exc
+        with stream:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    stream.seek(0, os.SEEK_END)
+                    if stream.tell() == 0:
+                        stream.write(b"\0")
+                        stream.flush()
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise MappingError(
+                    "另一个任务正在保存此 Excel 配对表，请稍后刷新配对再重试；现有文件未覆盖。"
+                ) from exc
+            # Closing the handle also releases the lock after an exception or
+            # process exit, so no stale-lock recovery can discard a live lock.
+            yield
 
     def _save(self, workbook, *, expected: bytes | None) -> None:
         temporary = None
