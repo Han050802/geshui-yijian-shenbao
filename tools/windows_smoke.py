@@ -33,7 +33,8 @@ def main() -> int:
             env = os.environ.copy()
             for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"):
                 env.pop(key, None)
-            system = Path(env["SystemRoot"])
+            # os.environ retains Windows' case-insensitive lookup; a dict copy does not.
+            system = Path(os.environ["SystemRoot"])
             env["PATH"] = str(system / "System32") + os.pathsep + str(system)
             env["PYTHONNOUSERSITE"] = "1"
             env["PLAYWRIGHT_BROWSERS_PATH"] = "0"
