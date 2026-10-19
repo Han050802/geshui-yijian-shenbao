@@ -121,7 +121,7 @@ class RuntimeSelfTestTests(unittest.TestCase):
         self.assertTrue(call.kwargs["headless"])
         self.assertTrue(call.kwargs["offline"])
         self.assertEqual(call.kwargs["service_workers"], "block")
-        self.assertEqual(call.kwargs["executable_path"], str(self.executable))
+        self.assertEqual(Path(call.kwargs["executable_path"]).resolve(), self.executable.resolve())
         self.assertNotIn("channel", call.kwargs)
         self.assertFalse(Path(call.args[0]).exists())
         self.assertNotIn(str(data), call.args[0])

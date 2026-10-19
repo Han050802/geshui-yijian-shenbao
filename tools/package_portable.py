@@ -16,6 +16,25 @@ def main() -> None:
     smoke = json.loads((ROOT / "build-reports/smoke-report.json").read_text(encoding="utf-8"))
     if smoke.get("status") != "passed":
         raise RuntimeError("Do not package unverified runtimes")
+    source_commit = os.environ.get("GITHUB_SHA", "")
+    if not source_commit or smoke.get("source_commit") != source_commit:
+        raise RuntimeError("Smoke report does not match the current source commit")
+    smoke_checks = smoke.get("checks")
+    if not isinstance(smoke_checks, dict):
+        raise RuntimeError("Smoke report is missing executable verification")
+    for name, relative in (
+        ("main", "runtime/TaxZero.exe"),
+        ("wechat", "runtime-wechat/WeChatReceipt.exe"),
+    ):
+        check = smoke_checks.get(name)
+        if not isinstance(check, dict) or check.get("exit_code") != 0:
+            raise RuntimeError("Missing successful smoke check: " + name)
+        executable = ROOT / relative
+        if not executable.is_file():
+            raise RuntimeError("Missing verified executable: " + relative)
+        current_digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+        if check.get("exe_sha256") != current_digest:
+            raise RuntimeError("Executable changed after its smoke check: " + relative)
     tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode("utf-8").split("\0")
     files = {}
     for relative in tracked:
@@ -33,7 +52,7 @@ def main() -> None:
             raise RuntimeError("Missing runtime entry point: " + required)
     checksums = [hashlib.sha256(path.read_bytes()).hexdigest() + "  " + relative
                  for relative, path in sorted(files.items())]
-    build_info = {"source_commit": os.environ.get("GITHUB_SHA", ""),
+    build_info = {"source_commit": source_commit,
                   "built_at_utc": datetime.now(timezone.utc).isoformat(),
                   "platform": "Windows x64", "smoke_test": "passed",
                   "source_files_and_runtime_files": len(files)}

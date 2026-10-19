@@ -12,9 +12,12 @@ from tax_desktop import TaxDesktop, DesktopError, live_windows
 class CompanySwitchTests(unittest.TestCase):
     def manager_adapter(self):
         adapter = self.adapter()
+        adapter.root = SimpleNamespace(handle=100)
         adapter.find_company_dialog = Mock(return_value=None)
         adapter.footer_matches = Mock(return_value=False)
         adapter.find_login_dialog = Mock(return_value=None)
+        # Popup capture/closing is outside these management retry tests.
+        adapter.dismiss_declare_success = Mock(return_value=False)
         adapter.bring_client_forward = Mock()
         adapter.click_text = Mock()
         return adapter
@@ -164,6 +167,7 @@ class CompanySwitchTests(unittest.TestCase):
 
     def adapter(self):
         adapter = TaxDesktop.__new__(TaxDesktop)
+        adapter.root = None
         adapter.log = Mock()
         adapter.cancelled = Mock()
         adapter.user32 = Mock()
@@ -205,13 +209,15 @@ class CompanySwitchTests(unittest.TestCase):
 
     def test_visible_foreground_dialog_is_not_restored_or_refocused(self):
         adapter = self.adapter()
-        adapter.root = SimpleNamespace(handle=100)
+        adapter.root = SimpleNamespace(handle=100, process_id=lambda: 1234)
         adapter.user32 = Mock()
         adapter.user32.GetForegroundWindow.return_value = 100
         adapter.user32.IsIconic.return_value = False
         adapter.user32.IsWindowVisible.return_value = True
         adapter.focus_window = Mock()
-        adapter.bring_client_forward()
+        # Model an unobstructed desktop without enumerating real Windows windows.
+        with patch("tax_desktop.live_windows", return_value=[]):
+            adapter.bring_client_forward()
         adapter.user32.ShowWindow.assert_not_called()
         adapter.user32.AttachThreadInput.assert_not_called()
         adapter.user32.keybd_event.assert_not_called()
