@@ -19,7 +19,7 @@ from unittest.mock import patch
 # These imports are checked without creating a WeChat client or an OCR request.
 # PyInstaller must collect the modules and native extensions listed here.
 DEPENDENCY_MODULES = (
-    "tkinter", "tkinter.ttk", "tkinter.messagebox", "tkinter.scrolledtext",
+    "tkinter", "tkinter.ttk", "tkinter.messagebox", "tkinter.scrolledtext", "tkinter.filedialog",
     "PIL", "PIL.Image", "PIL.ImageGrab", "pyperclip",
     "pythoncom", "pywintypes", "win32api", "win32con", "win32gui",
     "win32ui", "win32process", "win32clipboard", "win32com.client",
