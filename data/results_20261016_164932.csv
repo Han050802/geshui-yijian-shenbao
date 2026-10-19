@@ -1,0 +1,3 @@
+﻿公司名称,税号,税款所属月,状态,原因,证据
+北京楠舍楠分科技有限公司,,2026-09,UNKNOWN,CHECK_ATTACHMENTS失败（DesktopError）：扣缴端目标窗口未取得前台焦点，本次未点击，请关闭遮挡窗口后重试；本次尚未执行发送申报,C:\Users\Admin\Documents\Codex\2026-10-12\new-chat-8\outputs\个税一键申报\data\evidence\北京楠舍楠分科技有限公司_2026-09_UNKNOWN_20261016_164932.png
+北京浩运世纪文化传媒有限公司,,2026-09,SKIPPED,批次已停止,

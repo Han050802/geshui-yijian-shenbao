@@ -1,0 +1,17 @@
+# PyInstaller outputs. Rebuild with build.ps1.
+build-dist/
+build-work/
+runtime/
+runtime-next/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Chrome login session: cookies and saved credentials
+data/browser_profile/
+
+# Local run artifacts
+*.log
+wechat/wxauto_logs/
+data/evidence/

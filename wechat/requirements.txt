@@ -1,0 +1,5 @@
+# 微信 4.x 桌面客户端使用 wxauto4（基于 UIAutomation）。
+# 若仍是微信 3.9 客户端，可改为：wxauto>=39.1.0
+wxauto4>=41.1.7
+Pillow>=10.4.0
+winocr>=0.0.15

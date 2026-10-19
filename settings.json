@@ -1,0 +1,15 @@
+{
+  "url": "http://192.168.110.15:8765/",
+  "work_month": "2026-10",
+  "tax_month": "2026-09",
+  "expected_people": 1,
+  "expected_people_by_tax_id": {},
+  "expected_people_by_name": {},
+  "generate_zero": true,
+  "allow_missing_insurance": true,
+  "writeback": true,
+  "verify_url": "",
+  "feedback_timeout": 180,
+  "selectors": {},
+  "profile_note": "视频预设，需现场联调"
+}

@@ -1,0 +1,3 @@
+﻿公司名称,税号,税款所属月,状态,原因,证据
+北京楠舍楠分科技有限公司,,2026-09,SUCCESS,已核验申报成功,C:\Users\Admin\Documents\Codex\2026-10-12\new-chat-8\outputs\个税一键申报\data\evidence\北京楠舍楠分科技有限公司_2026-09_SUCCESS_20261016_154548.png
+北京浩运世纪文化传媒有限公司,,2026-09,FAILED,CHECK_ZERO失败（DesktopError）：出现未识别的提示窗口，已停止；本次尚未执行发送申报,C:\Users\Admin\Documents\Codex\2026-10-12\new-chat-8\outputs\个税一键申报\data\evidence\北京浩运世纪文化传媒有限公司_2026-09_FAILED_20261016_154724.png

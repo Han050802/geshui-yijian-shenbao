@@ -1,0 +1,32 @@
+Power Automate Desktop 启动示例
+
+这是手动配置动作的说明，不是 PAD 可导入格式。
+首次双击“一键启动.cmd”，完成独立 Chrome 工作台登录、业务条件核实和设置保存。
+运行会自动提交正式申报，仍须保持 Windows 桌面解锁和扣缴端可交互。
+
+方式一：运行应用程序（推荐）
+1. 新建桌面流，添加“运行应用程序”动作。
+2. 应用程序路径填写：
+   C:\Users\Admin\Documents\Codex\2026-10-12\new-chat-8\outputs\个税一键申报\runtime\TaxZero.exe
+3. 命令行参数：--run
+4. 工作文件夹：
+   C:\Users\Admin\Documents\Codex\2026-10-12\new-chat-8\outputs\个税一键申报
+5. 启动后：等待应用程序完成。
+6. 用条件动作检查 AppExitCode：0 为成功，2 为未完成；其他非零值也按失败处理。
+7. 未完成时查看 data 中的结果和回执；反馈不明时先核实税务端，勿直接重跑。
+
+方式二：运行 PowerShell 脚本
+添加“运行 PowerShell 脚本”，粘贴下面代码。若移动程序目录，修改绝对路径。
+
+$ErrorActionPreference = 'Stop'
+$taskProcess = Start-Process -FilePath 'C:\Users\Admin\Documents\Codex\2026-10-12\new-chat-8\outputs\个税一键申报\runtime\TaxZero.exe' -ArgumentList '--run' -WindowStyle Hidden -Wait -PassThru
+if ($taskProcess.ExitCode -ne 0) {
+    throw "个税申报未完成，退出码：$($taskProcess.ExitCode)。请查看本地结果并核实税务端状态。"
+}
+
+程序读取已保存 settings.json，不需要 CSV。税款所属月须在扣缴端预先选中。
+Esc 可停止。不要删除 data 中状态文件，避免失去防重复保护。
+
+Microsoft 官方动作参考：
+https://learn.microsoft.com/zh-cn/power-automate/desktop-flows/actions-reference/system
+https://learn.microsoft.com/zh-cn/power-automate/desktop-flows/actions-reference/scripting

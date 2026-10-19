@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "records": {
+    "北京万瑞铭诚商贸有限公司:2026-09": {
+      "state": "SUCCESS",
+      "reason": "已核验申报成功",
+      "evidence": "C:\\Users\\Admin\\Documents\\Codex\\2026-10-12\\new-chat-8\\outputs\\个税一键申报\\data\\evidence\\北京万瑞铭诚商贸有限公司_2026-09_SUCCESS_20261013_174230.png",
+      "updated_at": "2026-10-13T09:42:30.738483+00:00"
+    },
+    "北京楠舍楠分科技有限公司:2026-09": {
+      "state": "SUCCESS",
+      "reason": "已核验申报成功",
+      "evidence": "C:\\Users\\Admin\\Documents\\Codex\\2026-10-12\\new-chat-8\\outputs\\个税一键申报\\data\\evidence\\北京楠舍楠分科技有限公司_2026-09_SUCCESS_20261016_181039.png",
+      "updated_at": "2026-10-16T10:10:39.908913+00:00"
+    }
+  }
+}
