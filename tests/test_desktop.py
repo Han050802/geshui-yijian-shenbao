@@ -212,10 +212,18 @@ class DesktopParsingTests(unittest.TestCase):
     def test_contradictory_or_payment_feedback_is_not_success(self):
         for status, feedback in (("申报成功，无需缴款", "申报成功申报失败"),
                                  ("申报成功，无需缴款", "处理失败"),
-                                 ("申报成功，需缴款", "申报成功")):
+                                 ("申报成功，需缴款", "申报成功"),
+                                 ("申报成功，无需缴款", "申报成功，需缴款100.00元"),
+                                 ("申报成功，无需缴款", "申报成功，请缴款"),
+                                 ("申报成功，无需缴款", "申报成功，需要缴款"),
+                                 ("申报成功，无需缴款；需缴款", "申报成功")):
             with self.subTest(status=status, feedback=feedback), self.assertRaises(DesktopError):
                 success_feedback(status, feedback)
+
+    def test_matching_no_payment_feedback_is_accepted(self):
+        self.assertTrue(success_feedback("申报成功，无需缴款", "申报成功，无需缴款"))
 
 
 if __name__ == "__main__":
     unittest.main()
+

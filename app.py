@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import queue
@@ -14,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from core import Runner, StateStore, ValidationError, write_results
+from core import Runner, StateStore, ValidationError, _atomic_write, write_results
 
 
 def base_dir():
@@ -115,11 +116,17 @@ def read_forward_result(path, company_name, tax_label):
         return ""
     if not isinstance(data, dict):
         return ""
-    if str(data.get("company") or "") != company_name:
+    if not isinstance(data.get("company"), str) or data["company"] != company_name:
         return ""
-    if str(data.get("taxLabel") or "") != tax_label:
+    if not isinstance(data.get("taxLabel"), str) or data["taxLabel"] != tax_label:
         return ""
-    return str(data.get("sentTo") or "").strip()
+    destination = data.get("sentTo")
+    return destination.strip() if isinstance(destination, str) else ""
+
+
+def receipt_result_path(company):
+    key = hashlib.sha256(company.key.encode("utf-8")).hexdigest()
+    return BASE / "data" / "receipts" / f"{key}.json"
 
 
 class Controller:
@@ -172,10 +179,11 @@ class Controller:
                 raise
             self.settings = dict(settings)
 
-    def _write_back(self, company, row, lead):
+    def _write_back(self, company, row, lead, store):
         self.log(lead)
         try:
             written = self.web.mark_success(company)
+            store.set_step(company, "workbench", "DONE" if written is True else "PENDING")
         except Exception as exc:
             self.log("工作台回填异常：" + type(exc).__name__)
             written = False
@@ -185,6 +193,34 @@ class Controller:
             self.log("本家回填未完成，继续办理下一家")
         else:
             self.log("工作台回填已重新读取核验")
+
+    def _forward_once(self, company, store):
+        """Persist each receipt attempt before launch; never replay an uncertain send."""
+        step = store.step(company, "wechat")
+        if step and step["state"] == "DONE":
+            self.log("本公司本月微信回执已记录完成，跳过重复发送")
+            return step["destination"]
+        # A child may have written its receipt before the parent crashed.
+        for path in (receipt_result_path(company), BASE / "data" / "wechat-forward-result.json"):
+            recovered = read_forward_result(path, company.name, company.month)
+            if recovered:
+                store.set_step(company, "wechat", "DONE", destination=recovered,
+                               reason="从已保存的回执结果恢复")
+                self.log("已恢复本公司本月的微信成功记录，不再发送")
+                return recovered
+        if step is None or step["state"] in ("IN_PROGRESS", "UNKNOWN"):
+            store.set_step(company, "wechat", "UNKNOWN", reason="旧版记录或上次发送结果缺少明确回执")
+            self.log("本公司本月微信发送结果待核实，请到微信核对；程序不会自动重发")
+            return ""
+        store.set_step(company, "wechat", "IN_PROGRESS", reason="启动发送前已持久化")
+        try:
+            sent = self.forward_wechat(company)
+        except Exception as exc:
+            self.log("微信流程中断，发送结果待核实：" + type(exc).__name__)
+            sent = ""
+        store.set_step(company, "wechat", "DONE" if sent else "UNKNOWN", destination=sent,
+                       reason="微信返回明确成功结果" if sent else "可能已部分发送，请人工核对后处理")
+        return sent
 
     def forward_wechat(self, company):
         """申报成功已核验之后打开微信自动转发，并等到它自己关掉。"""
@@ -207,15 +243,17 @@ class Controller:
         data_dir = BASE / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
         company_file = data_dir / "current-company.json"
-        result_file = data_dir / "wechat-forward-result.json"
+        result_file = receipt_result_path(company)
+        result_file.parent.mkdir(parents=True, exist_ok=True)
         if result_file.exists():
-            result_file.unlink()
+            # Preserve durable evidence. An incomplete old result needs review.
+            return read_forward_result(result_file, company.name, company.month)
         payload = {
             "company": company.name,
             "taxLabel": company.month,
             "updatedAt": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
         }
-        company_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        _atomic_write(company_file, json.dumps(payload, ensure_ascii=False))
         self.log("正在打开微信自动转发。窗口关闭前，不点击工作台个税。")
         try:
             proc = subprocess.Popen(
@@ -269,7 +307,7 @@ class Controller:
         if task == "test_company":
             companies = only_test_company(companies)
             self.log(f"测试只运行：{TEST_COMPANY_NAME}，金额为0后发送申报")
-            task = "prepare"
+            task = "run"
         self.emit("companies", companies)
         if not companies:
             self.log("当前工作台页面没有待处理个税公司")
@@ -291,6 +329,16 @@ class Controller:
                 results.append(Runner._row(company, "SKIPPED", "批次已停止", ""))
                 continue
             if task == "prepare":
+                if store.get(company):
+                    row = Runner(adapter, store, self.log).run([company])[0]
+                    if row["状态"] == "SUCCESS":
+                        row["状态"] = "VERIFIED"
+                        row["原因"] = "已有申报核验成功；未回填"
+                    else:
+                        stopped = True
+                    results.append(row)
+                    write_results(report, results)
+                    continue
                 try:
                     self.log(f"准备并检查：{company.name}")
                     ready = adapter.prepare(company)
@@ -308,27 +356,8 @@ class Controller:
                         adapter.calculate(company)
                         adapter.check_attachments(company)
                         adapter.check_summary(company)
-                        if send_test:
-                            status = adapter.filing_status_text()
-                            if isinstance(status, str) and "申报成功" in status:
-                                self.log("申报已成功，不再发送")
-                                if adapter.verify(company) is not True:
-                                    raise ValidationError("已有提交记录未核验成功")
-                                evidence = adapter.evidence(company, "SUCCESS")
-                                store.set(company, "SUCCESS", "已核验申报成功", evidence)
-                                results.append(Runner._row(company, "VERIFIED", "已有申报核验成功；未回填", evidence))
-                            else:
-                                store.set(company, "SUBMITTING", "提交前已持久化")
-                                adapter.submit(company)
-                                if adapter.verify(company) is not True:
-                                    raise ValidationError("提交后未取得明确申报成功结果")
-                                evidence = adapter.evidence(company, "SUCCESS")
-                                store.set(company, "SUCCESS", "已核验申报成功", evidence)
-                                results.append(Runner._row(company, "SUCCESS", "已核验申报成功", evidence))
-                                self.log("已发送申报并核验成功")
-                        else:
-                            results.append(Runner._row(company, "PREPARED", "已到提交前；尚未发送申报", adapter.evidence(company,"PREPARED")))
-                            self.log("准备完成，本模式不会发送申报")
+                        results.append(Runner._row(company, "PREPARED", "已到提交前；尚未发送申报", adapter.evidence(company,"PREPARED")))
+                        self.log("准备完成，本模式不会发送申报")
                 except Exception as exc:
                     try:
                         diagnostic = getattr(adapter, "record_error", None)
@@ -350,17 +379,22 @@ class Controller:
                     stopped = True
                 elif partial_run:
                     self.log(f"{company.name}：申报成功已核验，打开微信自动转发")
-                    sent = self.forward_wechat(company)
+                    try:
+                        sent = self._forward_once(company, store)
+                    except Exception as exc:
+                        self.log("微信阶段记录未能保存，已停止自动发送：" + type(exc).__name__)
+                        sent = ""
                     if not sent:
+                        stopped = True
                         row["状态"] = "WRITEBACK_PENDING"
-                        row["原因"] = "税局申报已成功；微信自动转发未完成，未点击工作台个税。禁止重新申报。"
-                        self.log("微信自动转发没有完成，工作台先不点击个税")
+                        row["原因"] = "税局申报已成功；微信结果待核实，未点击工作台个税。禁止重新申报或自动重发回执。"
+                        self.log("微信结果待核实，批次已停止；请检查仍打开的微信回执窗口，工作台先不点击个税")
                     elif settings.get("writeback", True):
-                        self._write_back(company, row, "微信自动转发已运行完毕，正在工作台点击个税")
+                        self._write_back(company, row, "微信自动转发已运行完毕，正在核验工作台个税", store)
                     else:
                         self.log("微信自动转发已结束。当前未勾选回填，不点击工作台个税。")
-                elif settings.get("writeback", True):
-                    self._write_back(company, row, "税局已成功，点击工作台个税并等待刷新")
+                elif not send_test and settings.get("writeback", True):
+                    self._write_back(company, row, "税局已成功，核验工作台个税完成状态", store)
             write_results(report, results)
         write_results(report, results)
         stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
@@ -426,7 +460,7 @@ def gui():
         ttk.Entry(fields,textvariable=var,width=width).grid(row=i,column=1,sticky="w",padx=10,pady=3)
     checks=ttk.Frame(frame)
     checks.pack(fill="x",pady=10)
-    for key,title in (("generate_zero","工资表为空时生成零工资"),("allow_missing_insurance","允许三险一金为空"),("writeback","成功后回填工作台")):
+    for key,title in (("generate_zero","空工资表时允许复制上月数据"),("allow_missing_insurance","允许三险一金为空"),("writeback","成功后回填工作台")):
         var=tk.BooleanVar(value=settings[key]);variables[key]=var
         ttk.Checkbutton(checks,text=title,variable=var).pack(side="left",padx=(0,16))
     buttons=ttk.Frame(frame);buttons.pack(fill="x",pady=(0,10))
@@ -522,3 +556,4 @@ if __name__=="__main__":
     if args.run:
         sys.exit(cli_run())
     gui()
+

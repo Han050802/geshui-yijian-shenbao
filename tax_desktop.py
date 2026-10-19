@@ -305,9 +305,30 @@ def success_feedback(status, feedback):
     status, feedback = compact(status), compact(feedback)
     if any(t in status+feedback for t in ("申报失败", "处理失败")):
         raise DesktopError("反馈含失败结果，请人工核验，禁止重复发送")
-    if "需缴款" in status and "无需缴款" not in status:
+    # Remove only explicit no-payment phrases, then inspect BOTH sources. A
+    # stale status must not overrule a newer payment instruction in feedback.
+    payment_text = (status + feedback).replace("无需缴款", "").replace("无须缴款", "")
+    if any(word in payment_text for word in (
+            "需缴款", "须缴款", "需要缴款", "需缴税", "需要缴税", "须缴税",
+            "立即缴税", "立即缴款", "请缴款", "请缴税")):
         raise DesktopError("反馈要求缴款，不能视为零申报成功")
     return "申报成功" in status and "无需缴款" in status and "申报成功" in feedback
+
+
+def ocr_items(results, width, height, region=(0, 0, 1, 1), strict=False):
+    """Keep navigation tolerant, but never delete uncertain critical digits."""
+    x0, y0, _x1, _y1 = region
+    out = []
+    for box, text, confidence in results or []:
+        if not confidence >= .85:
+            if strict:
+                raise DesktopError("关键数据存在低置信度识别，已停止；请核对金额、人数或反馈")
+            continue
+        xs, ys = zip(*box)
+        out.append({"text": text, "x": (sum(xs)/4 + width*x0)/width,
+                    "y": (sum(ys)/4 + height*y0)/height,
+                    "w": (max(xs)-min(xs))/width, "h": (max(ys)-min(ys))/height})
+    return out
 
 
 class TaxDesktop:
@@ -532,7 +553,7 @@ class TaxDesktop:
                 gdi32.DeleteDC(memory)
             user32.ReleaseDC(hwnd, hdc)
 
-    def snap(self, region=None):
+    def snap(self, region=None, strict=False):
         import numpy as np
         self.focus_guard()
         self.ensure_shown()
@@ -548,15 +569,7 @@ class TaxDesktop:
         crop = image.crop((int(w*x0), int(h*y0), int(w*x1), int(h*y1)))
         # RGB input is supported by RapidOCR; convert explicitly to BGR.
         results, _ = self.ocr(np.array(crop)[:, :, ::-1].copy())
-        out = []
-        for box, text, confidence in results or []:
-            if confidence < .85:
-                continue
-            xs, ys = zip(*box)
-            out.append({"text": text, "x": (sum(xs)/4 + w*x0)/w,
-                        "y": (sum(ys)/4 + h*y0)/h,
-                        "w": (max(xs)-min(xs))/w, "h": (max(ys)-min(ys))/h})
-        return out
+        return ocr_items(results, w, h, (x0, y0, x1, y1), strict=strict)
 
     @staticmethod
     def text(items):
@@ -564,6 +577,9 @@ class TaxDesktop:
 
     def read(self, region):
         return self.text(self.snap(region))
+
+    def read_critical(self, region):
+        return self.text(self.snap(region, strict=True))
 
     def find_zero_income_dialog(self):
         """The three-month zero-income notice is its own window, not a control on the main frame."""
@@ -610,7 +626,7 @@ class TaxDesktop:
             self.fail("出现多个提示窗口，已停止")
         return found[0] if found else None
 
-    def confirm_import_dialog(self):
+    def confirm_import_dialog(self, company):
         """Accept the empty-table import confirmation. Do not log the dialog body."""
         import numpy as np
         dialog = self.find_message_dialog()
@@ -637,6 +653,7 @@ class TaxDesktop:
         button = choose_confirm_button(items)
         if button is None:
             self.fail("导入确认没有唯一的确定，已停止")
+        self.guard(company)
         self.log("工资表没有数据，导入确认点击确定后继续")
         self.focus_handle(dialog)
         dialog.click_input(coords=(round(button["x"] * width), round(button["y"] * height)))
@@ -683,7 +700,7 @@ class TaxDesktop:
             items.append({"text": label, "x": (sum(xs) / 4) / width, "y": (sum(ys) / 4) / height})
         return items, width, height
 
-    def copy_previous_month(self):
+    def copy_previous_month(self, company):
         """Choose 复制上月当期数据 and click 立即复制数据. Never click 导入 or 生成零工资."""
         deadline = time.monotonic() + 8
         dialog = None
@@ -699,6 +716,7 @@ class TaxDesktop:
         option = choose_copy_option(items)
         if option is None:
             self.fail("工资导入向导里没有唯一的复制上月当期数据")
+        self.guard(company)
         self.log("选择复制上月当期数据")
         self.focus_handle(dialog)
         dialog.click_input(coords=(round(option["x"] * width), round(option["y"] * height)))
@@ -714,6 +732,7 @@ class TaxDesktop:
                 break
         if button is None:
             self.fail("选择复制上月后没有出现立即复制")
+        self.guard(company)
         self.log("点击立即复制数据")
         self.focus_handle(dialog)
         dialog.click_input(coords=(round(button["x"] * width), round(button["y"] * height)))
@@ -748,12 +767,12 @@ class TaxDesktop:
             self.fail("出现多个同类提示窗口，已停止")
         return found[0] if found else None
 
-    def close_copy_result(self):
+    def close_copy_result(self, company=None, allow_calculation=False):
         """Close the copy-result window. Do not read its rows or click 保存."""
-        import numpy as np
         dialog = self.find_named_popup("结果")
         if dialog is None:
             return False
+        import numpy as np
         button = None
         action = "关闭结果"
         image = width = height = None
@@ -781,8 +800,9 @@ class TaxDesktop:
             button = choose_continue_tax_button(items)
             if button is None or "三险" not in body_text or "未填写" not in body_text:
                 self.fail("结果窗口按钮无法识别，已停止")
-            if not self.settings.get("allow_missing_insurance"):
+            if company is None or not allow_calculation or not company.allow_missing_insurance:
                 self.fail("检测到未填写三险一金提示，请核对该企业配置")
+            self.guard(company)
             action = "继续算税"
         self.log("复制完成后关闭提示并继续" if action == "关闭结果" else "三险一金未填写，点击继续算税")
         self.focus_handle(dialog)
@@ -809,17 +829,15 @@ class TaxDesktop:
             time.sleep(.5)
         self.fail("复制上月数据后仍在查询，已停止")
 
-    def dismiss_zero_income_prompt(self):
+    def dismiss_zero_income_prompt(self, company=None, allow_calculation=False):
         """Click 暂不跳转 and continue. Do not read or log the names inside the notice."""
         if self.root is not None and self.root.class_name() in ("TFrmNewCompanyMgrView", "TFrmCompanyMgrView", "TfrmLoginAuth"):
             return
-        self.close_copy_result()
-        if self.confirm_import_dialog() or self.find_import_wizard():
-            self.copy_previous_month()
-        import numpy as np
+        self.close_copy_result(company=company, allow_calculation=allow_calculation)
         dialog = self.find_zero_income_dialog()
         if dialog is None:
             return
+        import numpy as np
         image = self.capture_window(dialog)
         width, height = image.size
         crop = image.crop((0, int(height * .86), width, height))
@@ -914,12 +932,18 @@ class TaxDesktop:
         escaped = "".join("{"+c+"}" if c in "+^%~(){}" else c for c in value)
         send_keys(escaped, with_spaces=True, pause=.01, vk_packet=True)
 
-    def wait_ready(self, required=(), timeout=90, allow_login=False, allow_insurance=False):
+    def wait_ready(self, required=(), timeout=90, allow_login=False, allow_insurance=False,
+                   company=None, allow_import=False):
         deadline = time.monotonic()+timeout
         ready_since, previous = None, None
         while time.monotonic() < deadline:
             self.cancelled()
-            self.dismiss_zero_income_prompt()
+            # A salary import prompt may block the page while its zero totals
+            # remain readable. Report it to check_zero; never accept it here.
+            if allow_import and (self.find_import_wizard() is not None or
+                                 self.find_message_dialog() is not None):
+                return "IMPORT"
+            self.dismiss_zero_income_prompt(company=company, allow_calculation=allow_insurance)
             observed = self.snap((.19,.12,.99,.95))
             text = compact(self.text(observed))
             if "未填写三险一金" in text:
@@ -948,9 +972,6 @@ class TaxDesktop:
         self.fail("等待扣缴端响应超时；如已发送申报，禁止再次发送")
 
     def identity(self, company):
-        if self.footer_matches(company):
-            return
-        self.login_company(company)
         if not self.footer_matches(company):
             self.fail("扣缴端当前公司名称不匹配或不唯一")
 
@@ -1604,11 +1625,12 @@ class TaxDesktop:
             self._clear_clipboard()
         self.fail("单位管理登录后，当前操作单位仍不是目标公司")
 
-    def prepare(self, company):
+    def _prepare_navigation(self, company):
+        """Login and navigate without importing, calculating or submitting."""
         self.last_error = ""
         self.attach()
-        self.dismiss_zero_income_prompt()
-        self.wait_until_idle()
+        if self.find_import_wizard() is not None:
+            self.fail("存在未完成的工资导入向导，请人工关闭或完成后重试；本次未复制数据")
         self.login_company(company)
         # Login can rebuild the main frame. Bind the current window before
         # verifying identity/period and entering the declaration workflow.
@@ -1621,7 +1643,18 @@ class TaxDesktop:
         self.click_text("综合所得申报", (.03,.40,.18,.48), partial=False)
         self.wait_ready(("收入及减除填写", "税款计算"))
         self.guard(company)
+
+    def prepare(self, company):
+        self._prepare_navigation(company)
         # Stay on 收入及减除填写. 申报表报送 is only used after 附表填写.
+        return "READY"
+
+    def reconcile(self, company):
+        """Open existing filing results for recovery; never change tax data."""
+        self._prepare_navigation(company)
+        self.click_text("申报表报送", (.81,.19,.98,.26))
+        self.wait_ready(("申报状态", "本期收入"))
+        self.guard(company)
         return "READY"
 
     def return_to_step_list(self):
@@ -1642,23 +1675,31 @@ class TaxDesktop:
         self.click_text("收入及减除填写", (.22,.19,.40,.26))
         self.wait_ready(("正常工资薪金所得",))
         self.click_text("正常工资薪金所得", (.21,.37,.46,.44), partial=False)
-        self.wait_ready(("申报总人数", "收入总额", "更多操作"))
+        mode = self.wait_ready(("申报总人数", "收入总额", "更多操作"), allow_import=True)
         self.guard(company)
         try:
-            count = salary_totals(self.read((.49,.20,.91,.25)))
+            count = salary_totals(self.read_critical((.49,.20,.91,.25)))
         except DesktopError as exc:
             self.fail(str(exc))
         if count == 0:
+            if company.generate_zero is not True:
+                self.fail("工资表为空，未允许复制上月数据")
+            # This is the only import path. Identity, period and empty totals
+            # have all been checked; navigation/dialog cleanup cannot import.
+            self.guard(company)
             self.log("工资表为空，确认后复制上月当期数据")
-            copied = self.copy_previous_month() if (self.confirm_import_dialog() or self.find_import_wizard()) else False
+            copied = self.copy_previous_month(company) if (
+                self.confirm_import_dialog(company) or self.find_import_wizard()) else False
             if not copied:
                 self.fail("工资表为空，未出现复制上月当期数据")
             self.wait_ready(("申报总人数", "收入总额", "更多操作"))
             self.guard(company)
             try:
-                count = salary_totals(self.read((.49,.20,.91,.25)))
+                count = salary_totals(self.read_critical((.49,.20,.91,.25)))
             except DesktopError as exc:
                 self.fail(str(exc))
+        elif mode == "IMPORT":
+            self.fail("工资表已有数据但出现导入提示，已停止")
         if count != company.expected_people:
             self.fail(f"申报人数{count}与配置人数{company.expected_people}不一致")
         self.click_text("返回", (.21,.25,.28,.32), partial=False)
@@ -1667,15 +1708,17 @@ class TaxDesktop:
     def calculate(self, company):
         self.guard(company)
         self.click_text("税款计算", (.41,.19,.59,.26))
-        mode = self.wait_ready(("附表填写",), allow_insurance=company.allow_missing_insurance)
+        mode = self.wait_ready(("附表填写",), allow_insurance=company.allow_missing_insurance,
+                               company=company)
         if mode == "INSURANCE":
+            self.guard(company)
             self.click_text("继续算税", (.59,.69,.68,.75), partial=False)
             self.wait_ready(("附表填写",))
         self.guard(company)
 
     def calculation_is_ready(self):
         """The tax-calculation banner must show this period and only zero amounts."""
-        text = compact(self.read((.18, .26, .98, .40)))
+        text = compact(self.read_critical((.18, .26, .98, .40)))
         if "税款计算" not in text or "应补退税额" not in text:
             return False
         amounts = re.findall(r"(?:本期收入总额|应补退税额)[:：]?([+-]?[\d,]+\.\d{2})", text)
@@ -1744,7 +1787,7 @@ class TaxDesktop:
             if label not in header:
                 self.fail("申报汇总列标题无法核验")
             try:
-                require_zero(self.read((left,.48,right,.535)))
+                require_zero(self.read_critical((left,.48,right,.535)))
             except DesktopError as exc:
                 self.fail(f"{label}：{exc}")
 
@@ -1752,7 +1795,7 @@ class TaxDesktop:
         # Re-read immediately before the one and only submission click.
         self.wait_until_idle()
         self.validate_summary(company)
-        status = compact(self.read((.30,.365,.53,.41)))
+        status = compact(self.read_critical((.30,.365,.53,.41)))
         if status not in ("待申报", "未申报"):
             self.fail("提交前申报状态已变化，禁止再次发送")
         self.evidence(company, "BEFORE_SUBMIT")
@@ -1761,7 +1804,7 @@ class TaxDesktop:
         self.click_continue_declare()
 
     def filing_status_text(self):
-        return compact(self.read((.30, .365, .53, .41)))
+        return compact(self.read_critical((.30, .365, .53, .41)))
 
     def verify(self, company):
         deadline = time.monotonic()+int(self.settings.get("feedback_timeout",180))
@@ -1769,8 +1812,8 @@ class TaxDesktop:
         while time.monotonic() < deadline:
             self.wait_ready(("申报状态",), timeout=90)
             self.guard(company)
-            status = compact(self.read((.30,.365,.53,.41)))
-            feedback = compact(self.read((.21,.74,.96,.94)))
+            status = compact(self.read_critical((.30,.365,.53,.41)))
+            feedback = compact(self.read_critical((.21,.74,.96,.94)))
             # Contradictory feedback is not success, even when an older status
             # cell still says success/no-payment.
             try:
@@ -1808,3 +1851,4 @@ class TaxDesktop:
             return str(path.resolve())
         except Exception:
             return ""
+

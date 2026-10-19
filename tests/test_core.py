@@ -24,6 +24,10 @@ class FakeAdapter:
         self.action("prepare")
         return "READY"
 
+    def reconcile(self, company):
+        self.action("reconcile")
+        return "READY"
+
     def check_zero(self, company): self.action("check_zero")
     def calculate(self, company): self.action("calculate")
     def check_attachments(self, company): self.action("check_attachments")
@@ -33,7 +37,7 @@ class FakeAdapter:
         return False
     def filing_status_text(self):
         self.action("filing_status_text")
-        return ""
+        return "待申报"
     def submit(self, company): self.action("submit")
     def verify(self, company):
         self.action("verify")
@@ -111,7 +115,8 @@ class CoreTests(unittest.TestCase):
         adapter.filing_status_text = lambda: "申报成功,无需缴款"
         self.assertEqual(self.run_adapter(adapter)[0]["状态"], "SUCCESS")
         self.assertNotIn("submit", adapter.calls)
-        self.assertIn("check_summary", adapter.calls)
+        self.assertNotIn("check_summary", adapter.calls)
+        self.assertIn("reconcile", adapter.calls)
         self.assertIn("verify", adapter.calls)
 
     def test_batch_stops_and_records_skipped(self):
@@ -121,23 +126,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([r["状态"] for r in rows], ["FAILED", "SKIPPED"])
         self.assertEqual(adapter.calls.count("prepare"), 1)
 
-    def test_history_does_not_skip_full_flow_when_client_is_pending(self):
+    def test_history_pending_requires_reconciliation_and_never_resubmits(self):
         for state in ("SUCCESS", "UNKNOWN", "SUBMITTING"):
             with self.subTest(state=state):
                 self.store.set(self.company, state)
-                adapter = FakeAdapter()
+                adapter = FakeAdapter(verified=False)
                 adapter.filing_status_text = lambda: "待申报"
-                self.assertEqual(self.run_adapter(adapter)[0]["状态"], "SUCCESS")
-                self.assertEqual(adapter.calls, ["prepare", "check_zero", "calculate",
-                    "check_attachments", "check_summary", "submit", "verify"])
+                self.assertEqual(self.run_adapter(adapter)[0]["状态"], "UNKNOWN")
+                self.assertEqual(adapter.calls, ["reconcile", "verify"])
 
-    def test_live_success_does_full_checks_but_never_resubmits(self):
+    def test_live_success_only_reconciles_existing_submission(self):
         self.store.set(self.company, "UNKNOWN")
         adapter = FakeAdapter()
         adapter.filing_status_text = lambda: "申报成功,无需缴款"
         self.assertEqual(self.run_adapter(adapter)[0]["状态"], "SUCCESS")
-        self.assertEqual(adapter.calls, ["prepare", "check_zero", "calculate",
-            "check_attachments", "check_summary", "verify"])
+        self.assertEqual(adapter.calls, ["reconcile", "verify"])
 
     def write_csv(self, rows):
         path = self.directory / "companies.csv"
@@ -186,3 +189,4 @@ class CoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

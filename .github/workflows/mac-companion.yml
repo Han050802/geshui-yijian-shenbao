@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - codex/mac-companion-20261019
+      - codex/audit-fixes-20261019
   workflow_dispatch:
 
 permissions:
@@ -111,3 +112,4 @@ jobs:
           path: build-reports-mac/*
           if-no-files-found: ignore
           retention-days: 7
+

@@ -112,16 +112,21 @@ class SearchSelectionTests(OfflineTestCase):
             ("section", "群聊"), ("result", "财务群"), ("result", "财务群"),
         ], "财务群", None, ambiguous=True)
 
-    def test_fallback_exact_name_can_be_repeated_in_search_results(self):
+    def test_fallback_repeated_contact_name_is_ambiguous(self):
         self.assert_selection([
             ("section", "联系人"), ("result", "王书涵"),
             ("result", "王书涵"), ("result", "王书涵"),
-        ], "王书涵", 1, exact=True)
+        ], "王书涵", None, exact=True, ambiguous=True)
 
-    def test_repeated_fallback_names_without_category_use_first_exact_hit(self):
+    def test_repeated_fallback_names_without_category_are_ambiguous(self):
         self.assert_selection([
             ("result", "王书涵"), ("result", "王书涵"), ("result", "王书涵"),
-        ], "王书涵", 0, exact=True)
+        ], "王书涵", None, exact=True, ambiguous=True)
+
+    def test_fallback_repeated_full_group_name_is_ambiguous(self):
+        self.assert_selection([
+            ("section", "群聊"), ("result", "财务兜底群"), ("result", "财务兜底群"),
+        ], "财务兜底群", None, exact=True, ambiguous=True)
 
     def test_whitespace_and_member_count_allow_keyword_match(self):
         self.assert_selection([
@@ -160,11 +165,13 @@ class SearchSelectionTests(OfflineTestCase):
             self.assert_selection(rows, "财务群", 1 if len(rows) == 2 else 0, exact=True)
             self.assert_selection(rows, "财务", None)
 
-    def test_same_full_name_in_distinct_contact_sections_is_not_ambiguous(self):
-        self.assert_selection([
-            ("section", "最常使用"), ("result", "文件传输助手"),
-            ("section", "联系人"), ("result", "文件传输助手"),
-        ], "文件传输助手", 1, exact=True)
+    def test_same_full_name_in_distinct_sections_needs_stable_identity(self):
+        for exact in (False, True):
+            with self.subTest(exact=exact):
+                self.assert_selection([
+                    ("section", "最常使用"), ("result", "文件传输助手"),
+                    ("section", "联系人"), ("result", "文件传输助手"),
+                ], "文件传输助手", None, exact=exact, ambiguous=True)
 
     def test_group_section_with_result_count_allows_keyword(self):
         for section in ("群聊(1)", "群聊（1）", "群聊1"):
@@ -383,3 +390,4 @@ class DeliveryTests(OfflineTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

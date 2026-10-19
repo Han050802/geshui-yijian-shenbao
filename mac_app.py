@@ -351,6 +351,7 @@ class MacApp:
         self.loading_settings = False
         self.next_poll = 0.0
         self.log_lines = 0
+        self._shown_job_errors: set[tuple[str, str, str]] = set()
         self._last_store_record = None
         self._build_ui()
         if read_saved:
@@ -406,7 +407,7 @@ class MacApp:
             entry.grid(row=1, column=column + 1, sticky="ew", padx=(8, 0), pady=4)
             self.setting_widgets.append(entry)
             fields.columnconfigure(column + 1, weight=1)
-        for column, key, label, default in ((0, "generate_zero", "工资表为空时生成零工资", False),
+        for column, key, label, default in ((0, "generate_zero", "空工资表时允许复制上月数据", False),
                                              (2, "allow_missing_insurance", "允许三险一金为空", False),
                                              (4, "writeback", "成功后回填工作台", True)):
             self.variables[key] = tk.BooleanVar(value=default)
@@ -650,9 +651,19 @@ class MacApp:
                 self.settings_server_id = self.state.server_id
             hostname = str(value.get("hostname") or "Windows")
             self.connection_var.set(f"已连接 {hostname} · 任务在 Windows 执行；连接码已保存在这台 Mac。")
+            event_job = None
             for event in events:
-                if event.get("kind") == "log":
-                    self._log(str(event.get("value", "")))
+                if event.get("kind") == "job":
+                    event_job = _job(event.get("value"))
+                elif event.get("kind") == "log":
+                    message = str(event.get("value", ""))
+                    if message.startswith("已停止："):
+                        self._show_job_error(event_job or self.state.view_job,
+                                             message[len("已停止："):], prefix="已停止：")
+                    else:
+                        self._log(message)
+                elif event.get("kind") == "error":
+                    self._show_job_error(event_job or self.state.view_job, event.get("value"))
             if operation == "connect":
                 self._log("连接成功，已恢复 Windows 当前状态。未自动发送任何任务。")
             self._render_tables()
@@ -666,8 +677,22 @@ class MacApp:
                 self.state._track(job)
                 self.state.active_job = job if job["status"] in BUSY_STATUSES else None
             self._log("Windows 已收到停止请求；请等待当前步骤结束并核验已提交的结果。")
+        # Events are memory-only on Windows. A reconnect must also recover the
+        # durable terminal reason, even after the host process has restarted.
+        if self.state.view_job:
+            self._show_job_error(self.state.view_job, self.state.view_job.get("error"))
         self.next_poll = time.monotonic() + (0.1 if operation in ("submit", "stop") else 1.0)
         self._save_connection()
+
+    def _show_job_error(self, job: dict | None, value: Any, *, prefix: str = "任务提示：") -> None:
+        if not isinstance(value, str) or not value.strip():
+            return
+        message = value.strip()
+        key = (self.state.server_id, str(job.get("id", "")) if job else "", message)
+        if key in self._shown_job_errors:
+            return
+        self._shown_job_errors.add(key)
+        self._log(prefix + message)
 
     def _network_failed(self, operation: str, error: Exception) -> None:
         if operation == "submit":
@@ -723,7 +748,10 @@ class MacApp:
         elif self.state.view_job:
             job = self.state.view_job
             task = ACTION_LABELS.get(job.get("task"), "Windows 任务")
-            self.progress_var.set(f"{task} · {STATUS_LABELS[job['status']]} · 企业 {len(self.state.companies)} 家 / 结果 {len(self.state.results)} 条")
+            progress = f"{task} · {STATUS_LABELS[job['status']]} · 企业 {len(self.state.companies)} 家 / 结果 {len(self.state.results)} 条"
+            if isinstance(job.get("error"), str) and job["error"].strip():
+                progress += "\n原因：" + job["error"].strip()
+            self.progress_var.set(progress)
         else:
             self.progress_var.set(f"已连接，等待操作 · 企业 {len(self.state.companies)} 家 / 结果 {len(self.state.results)} 条")
 
@@ -761,6 +789,7 @@ class MacApp:
         self.console.delete("1.0", "end")
         self.console.configure(state="disabled")
         self.log_lines = 0
+        self._shown_job_errors.clear()
 
     def export_results(self) -> None:
         if not self.state.results:
@@ -868,3 +897,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

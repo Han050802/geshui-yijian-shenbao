@@ -198,6 +198,7 @@ class Workbench:
         if (parts.netloc != target.netloc or parts.scheme != target.scheme or
                 parts.path != target.path or q.get("ym") != [self.settings["work_month"]] or
                 (not verification and q.get("tab") != ["pending"]) or
+                (verification and (len(q.get("tab", [])) != 1 or q["tab"] == ["pending"])) or
                 (not verification and not self.partial_list and q.get("situation") != ["all_zero"])):
             raise ValidationError("工作台不在指定月份的待办零申报页面，禁止继续")
 
@@ -231,7 +232,7 @@ class Workbench:
             query = parse_qs(parts.query)
             return (parts.scheme == pending.scheme and parts.netloc == pending.netloc and
                     parts.path == pending.path and query.get("ym") == [self.settings["work_month"]] and
-                    query.get("tab") != ["pending"])
+                    len(query.get("tab", [])) == 1 and query["tab"] != ["pending"])
         configured = self.settings.get("verify_url", "")
         if configured:
             value = urljoin(self.page.url, configured)
@@ -248,7 +249,7 @@ class Workbench:
                 if valid(value):
                     found.add(value)
         if len(found) != 1:
-            raise ValidationError("不能唯一发现完成核验列表，请配置 verify_url；未进行工作台回填")
+            raise ValidationError("不能唯一发现完成核验列表，请配置 verify_url；工作台回填尚未核验")
         return found.pop()
 
     def _optional_tax_id(self, row):
@@ -370,7 +371,7 @@ class Workbench:
                               "aria_pressed": button.get_attribute("aria-pressed")})
         return parse_rows(snapshots, self.settings)
 
-    def _find_row(self, name, verification=False):
+    def _find_row(self, name, verification=False, *, allow_missing=False):
         table, rows = self._rows(verification)
         self._check_pagination()
         read_name = self._name_getter(table)
@@ -380,6 +381,8 @@ class Workbench:
             row = rows.nth(i)
             if self._tax_button(row).count() and read_name(row).strip() == wanted:
                 matches.append(row)
+        if not matches and allow_missing:
+            return None
         if len(matches) != 1:
             raise ValidationError("无法按公司名称唯一定位工作台公司")
         return matches[0]
@@ -397,7 +400,7 @@ class Workbench:
             self.page.wait_for_timeout(1200)
 
     def mark_success(self, company):
-        """Click 个税 on the open list, then wait for that page to refresh."""
+        """Write once, then reread persisted completion for this company/month."""
         if self.page is None or company.month != self.settings["tax_month"]:
             return False
         try:
@@ -406,21 +409,47 @@ class Workbench:
             if button.count() != 1:
                 self.log("工作台没有找到该公司的个税按钮")
                 return False
-            try:
-                status = filing_status(button.inner_text(), button.get_attribute("aria-pressed"))
-            except ValidationError:
-                status = "pending"
+            status = filing_status(button.inner_text(), button.get_attribute("aria-pressed"))
+            pending_url = self.page.url
             if status == "done":
                 self.log(f"工作台个税已勾选：{company.name}")
             else:
                 self.log(f"点击工作台个税：{company.name}")
                 button.click()
             self._wait_refresh()
-            self.log("工作台已刷新，继续下一家")
-            return True
+            # A successful click/network-idle only proves that the browser acted.
+            # Reload to reject optimistic UI updates when the server save failed.
+            self.page.reload(wait_until="domcontentloaded")
+            self._wait_refresh()
+            refreshed = self._find_row(company.name, allow_missing=True)
+            if refreshed is not None:
+                verified = self._row_is_done(refreshed)
+            else:
+                # Disappearing from pending is not itself completion evidence.
+                # Keep the original (possibly partial-zero) URL for the next item.
+                verify_url = self._verification_url()
+                try:
+                    self.page.goto(verify_url, wait_until="domcontentloaded")
+                    self._wait_refresh()
+                    verified = self._row_is_done(self._find_row(company.name, verification=True))
+                finally:
+                    self.page.goto(pending_url, wait_until="domcontentloaded")
+                    self._wait_refresh()
+                    self._assert_scope()
+            if verified:
+                self.log(f"工作台个税完成状态已重新读取核验：{company.name}")
+            else:
+                self.log("工作台重新读取后仍未确认个税完成，保留待回填状态。")
+            return verified
         except Exception:
-            self.log("工作台个税点击未完成，继续下一家前请看一眼页面。")
+            self.log("工作台个税回填未核验，保留待回填状态。")
             return False
+
+    def _row_is_done(self, row):
+        button = self._tax_button(row)
+        if button.count() != 1:
+            raise ValidationError("工作台没有唯一找到该公司的个税按钮")
+        return filing_status(button.inner_text(), button.get_attribute("aria-pressed")) == "done"
 
     def close(self):
         try:
@@ -430,3 +459,4 @@ class Workbench:
             if self.playwright is not None:
                 self.playwright.stop()
             self.page = self.context = self.playwright = None
+

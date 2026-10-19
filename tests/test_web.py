@@ -1,7 +1,8 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock
 
-from core import ValidationError
+from core import Company, ValidationError
 from web_workbench import browser_network_failure, browser_profile_locked, filing_status, parse_rows, Workbench
 
 
@@ -101,7 +102,8 @@ class WebValidationTests(unittest.TestCase):
         workbench.page = Mock(url=workbench._url())
         self.assertEqual(workbench._verification_url(), "https://example.test/finance/tax?ym=2026-10&tab=all")
         for invalid in ("https://foreign.test/finance/tax?ym=2026-10&tab=all",
-                        "/finance/tax?ym=2026-09&tab=all", "/finance/tax?ym=2026-10&tab=pending"):
+                        "/finance/tax?ym=2026-09&tab=all", "/finance/tax?ym=2026-10&tab=pending",
+                        "/finance/tax?ym=2026-10"):
             workbench.settings["verify_url"] = invalid
             with self.assertRaises(ValidationError):
                 workbench._verification_url()
@@ -140,5 +142,127 @@ class WebValidationTests(unittest.TestCase):
             workbench._verification_url()
 
 
+class WritebackVerificationTests(unittest.TestCase):
+    """Exercise writeback and row matching against an inert server/DOM model."""
+    def setUp(self):
+        settings = {"work_month": "2026-10", "tax_month": "2026-09",
+                    "url": "https://example.test/",
+                    "verify_url": "/finance/tax?ym=2026-10&tab=all"}
+        self.company = Company("甲公司", "", "2026-09", 1)
+        self.workbench = Workbench(settings, ".")
+        self.pending_url = self.workbench._url()
+        self.page = Mock(url=self.pending_url)
+        self.workbench.page = self.page
+        self.initial = self.row("个税")
+        self.current_rows = [self.initial]
+        self.persisted_rows = [self.row("个税")]
+        self.completed_rows = []
+        self.page.reload.side_effect = self.reload
+        self.page.goto.side_effect = self.goto
+        self.workbench._rows = self.rows
+        self.workbench._check_pagination = Mock()
+        self.workbench._name_getter = lambda _table: lambda row: row.company_name
+        self.workbench._tax_button = lambda row: row.button
+
+    @staticmethod
+    def row(text, name="甲公司"):
+        button = Mock()
+        button.count.return_value = 1
+        button.inner_text.return_value = text
+        button.get_attribute.return_value = None
+        return SimpleNamespace(company_name=name, button=button)
+
+    def rows(self, verification=False):
+        self.workbench._assert_scope(verification)
+        rows = Mock()
+        rows.count.return_value = len(self.current_rows)
+        rows.nth.side_effect = self.current_rows.__getitem__
+        return Mock(), rows
+
+    def reload(self, **_kwargs):
+        self.current_rows = self.persisted_rows
+
+    def goto(self, url, **_kwargs):
+        self.page.url = url
+        self.current_rows = self.persisted_rows if url == self.pending_url else self.completed_rows
+
+    def test_failed_save_rejects_optimistic_checkmark(self):
+        self.initial.button.click.side_effect = lambda: setattr(
+            self.initial.button.inner_text, "return_value", "个税 ✔")
+        self.assertFalse(self.workbench.mark_success(self.company))
+        self.initial.button.click.assert_called_once()
+        self.page.reload.assert_called_once_with(wait_until="domcontentloaded")
+        self.persisted_rows[0].button.inner_text.assert_called_once()
+        self.page.goto.assert_not_called()
+
+    def test_persisted_checkmark_is_verified(self):
+        self.persisted_rows = [self.row("个税 ✔")]
+        self.assertTrue(self.workbench.mark_success(self.company))
+        self.page.reload.assert_called_once()
+        self.persisted_rows[0].button.inner_text.assert_called_once()
+
+    def test_disappearing_row_requires_completed_list_and_restores_partial_filter(self):
+        self.workbench.partial_list = True
+        self.pending_url = self.pending_url.replace("all_zero", "partial_zero")
+        self.page.url = self.pending_url
+        self.persisted_rows = []
+        self.completed_rows = [self.row("个税 ✔")]
+        self.assertTrue(self.workbench.mark_success(self.company))
+        self.assertEqual([call.args[0] for call in self.page.goto.call_args_list], [
+            "https://example.test/finance/tax?ym=2026-10&tab=all", self.pending_url])
+        self.assertEqual(self.page.url, self.pending_url)
+        self.completed_rows[0].button.inner_text.assert_called_once()
+        self.completed_rows[0].button.click.assert_not_called()
+
+    def test_disappearing_row_is_not_completion_when_all_list_is_pending(self):
+        self.persisted_rows = []
+        self.completed_rows = [self.row("个税")]
+        self.assertFalse(self.workbench.mark_success(self.company))
+        self.assertEqual(self.page.url, self.pending_url)
+
+    def test_missing_or_ambiguous_completed_company_is_not_success(self):
+        for completed_rows in ([], [self.row("个税 ✔", "乙公司")],
+                               [self.row("个税 ✔"), self.row("个税 ✔")]):
+            with self.subTest(companies=len(completed_rows)):
+                self.current_rows = [self.initial]
+                self.persisted_rows = []
+                self.completed_rows = completed_rows
+                self.assertFalse(self.workbench.mark_success(self.company))
+                self.assertEqual(self.page.url, self.pending_url)
+
+    def test_unknown_initial_status_never_clicks(self):
+        self.initial.button.inner_text.return_value = "个税 待确认"
+        self.assertFalse(self.workbench.mark_success(self.company))
+        self.initial.button.click.assert_not_called()
+        self.page.reload.assert_not_called()
+
+    def test_unknown_reloaded_status_is_not_success(self):
+        self.persisted_rows = [self.row("个税 待确认")]
+        self.assertFalse(self.workbench.mark_success(self.company))
+        self.initial.button.click.assert_called_once()
+
+    def test_existing_checkmark_must_still_survive_reload(self):
+        self.initial.button.inner_text.return_value = "个税 ✔"
+        self.assertFalse(self.workbench.mark_success(self.company))
+        self.initial.button.click.assert_not_called()
+        self.page.reload.assert_called_once()
+
+    def test_reload_error_is_not_success(self):
+        self.page.reload.side_effect = RuntimeError("offline transport error")
+        self.assertFalse(self.workbench.mark_success(self.company))
+
+    def test_completion_redirect_to_wrong_month_is_rejected_and_restored(self):
+        self.persisted_rows = []
+        self.completed_rows = [self.row("个税 ✔")]
+        def redirect(url, **kwargs):
+            self.goto(url, **kwargs)
+            if url != self.pending_url:
+                self.page.url = url.replace("2026-10", "2026-09")
+        self.page.goto.side_effect = redirect
+        self.assertFalse(self.workbench.mark_success(self.company))
+        self.assertEqual(self.page.url, self.pending_url)
+
+
 if __name__ == "__main__":
     unittest.main()
+

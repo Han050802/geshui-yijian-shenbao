@@ -141,8 +141,8 @@ with plist_path.open("rb") as stream:
 info.update({
     "CFBundleName": "个税一键申报 Mac",
     "CFBundleDisplayName": "个税一键申报 Mac",
-    "CFBundleShortVersionString": "1.0.0",
-    "CFBundleVersion": "2026.10.19",
+    "CFBundleShortVersionString": "1.0.1",
+    "CFBundleVersion": "1.0.1",
     "LSMinimumSystemVersion": "15.0",
     "NSHighResolutionCapable": True,
     "NSLocalNetworkUsageDescription": "连接您配对的 Windows 电脑，查看并启动其申报任务。",
@@ -156,3 +156,4 @@ PY
 /usr/bin/codesign --verify --deep --strict --verbose=2 'build-dist-mac/个税一键申报 Mac.app'
 "$MAC_VENV_PYTHON" tools/mac_smoke.py
 echo 'Native Mac build and relocated offline UI self-test completed.'
+

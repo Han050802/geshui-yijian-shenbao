@@ -35,6 +35,8 @@ class AppIntegrationTests(unittest.TestCase):
         self.controller.ensure_web = MagicMock()
         self.adapter = MagicMock()
         self.adapter.prepare.return_value = "READY"
+        self.adapter.reconcile.return_value = "READY"
+        self.adapter.filing_status_text.return_value = "待申报"
         self.adapter.calculation_is_ready.return_value = False
         self.adapter.verify.return_value = True
         self.adapter.evidence.return_value = "evidence.png"
@@ -76,7 +78,7 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertEqual(self.adapter.submit.call_count, 2)
         self.assertNotIn("secret-password", str(self.events))
 
-    def test_rerun_checks_full_flow_then_verifies_live_success(self):
+    def test_rerun_only_verifies_live_success(self):
         self.controller.web.read_companies.return_value = self.companies[:1]
         self.controller.web.mark_success.return_value = False
         self.run_controller()
@@ -86,10 +88,11 @@ class AppIntegrationTests(unittest.TestCase):
         self.controller.web.mark_success.return_value = True
         rows = self.run_controller()
         self.assertEqual(rows[0]["状态"], "SUCCESS")
-        self.adapter.prepare.assert_called_once_with(self.companies[0])
-        self.adapter.check_zero.assert_called_once_with(self.companies[0])
-        self.adapter.calculate.assert_called_once_with(self.companies[0])
-        self.adapter.check_summary.assert_called_once_with(self.companies[0])
+        self.adapter.prepare.assert_not_called()
+        self.adapter.check_zero.assert_not_called()
+        self.adapter.calculate.assert_not_called()
+        self.adapter.check_summary.assert_not_called()
+        self.adapter.reconcile.assert_called_once_with(self.companies[0])
         self.adapter.verify.assert_called_once_with(self.companies[0])
         self.adapter.submit.assert_not_called()
 
@@ -169,8 +172,8 @@ class AppIntegrationTests(unittest.TestCase):
         self.controller.forward_wechat.return_value = ""
         rows = self.run_controller("test_partial")
         self.controller.web.mark_success.assert_not_called()
-        self.assertEqual([row["状态"] for row in rows], ["WRITEBACK_PENDING", "WRITEBACK_PENDING"])
-        self.assertEqual(self.adapter.submit.call_count, 2)
+        self.assertEqual([row["状态"] for row in rows], ["WRITEBACK_PENDING", "SKIPPED"])
+        self.assertEqual(self.adapter.submit.call_count, 1)
         self.assertEqual(self.durable(companies[0])["state"], "SUCCESS")
 
     def test_partial_missing_program_does_not_click_tax(self):
@@ -205,16 +208,17 @@ class AppIntegrationTests(unittest.TestCase):
         self.adapter.prepare.assert_not_called()
         self.adapter.submit.assert_not_called()
 
-    def test_test_button_ignores_history_and_checks_complete_flow(self):
+    def test_test_button_reconciles_history_without_new_submission(self):
         target = Company(app.TEST_COMPANY_NAME, "", "2026-09", 1)
         self.controller.web.read_companies.return_value = [target]
         StateStore(self.base / "data" / "state.json").set(target, "UNKNOWN")
         self.adapter.filing_status_text.return_value = "待申报"
         rows = self.run_controller("test_company")
         self.assertEqual(rows[0]["状态"], "SUCCESS")
-        self.adapter.check_zero.assert_called_once_with(target)
-        self.adapter.submit.assert_called_once_with(target)
-        self.adapter.check_summary.assert_called_once_with(target)
+        self.adapter.reconcile.assert_called_once_with(target)
+        self.adapter.check_zero.assert_not_called()
+        self.adapter.submit.assert_not_called()
+        self.adapter.check_summary.assert_not_called()
         self.adapter.verify.assert_called_once_with(target)
         self.assertEqual(self.durable(target)["state"], "SUCCESS")
 
@@ -228,3 +232,4 @@ class AppIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

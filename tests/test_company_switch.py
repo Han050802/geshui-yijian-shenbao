@@ -1,8 +1,9 @@
 """Company-switch regressions, with no real desktop or tax submissions."""
 import sys
 import unittest
+import ctypes
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -119,6 +120,7 @@ class CompanySwitchTests(unittest.TestCase):
         adapter.open_company_row = Mock(return_value=True)
         adapter.wait_logged_in = Mock()
         adapter._clear_clipboard = Mock()
+        adapter.dismiss_declare_success = Mock(return_value=False)
         company = SimpleNamespace(name="甲公司")
         adapter.login_company(company)
         adapter.click_text.assert_not_called()
@@ -138,7 +140,8 @@ class CompanySwitchTests(unittest.TestCase):
         adapter.login_company.assert_not_called()
 
     def test_closed_popup_during_enumeration_does_not_abort_main_window(self):
-        from pywinauto.controls.hwndwrapper import InvalidWindowHandle
+        class InvalidWindowHandle(Exception):
+            pass
         native = Mock()
         def enumerate_handles(callback, unused):
             for hwnd in (11, 12, 13):
@@ -147,9 +150,12 @@ class CompanySwitchTests(unittest.TestCase):
         native.EnumWindows.side_effect = enumerate_handles
         native.IsWindow.side_effect = [False, True, True]
         main = Mock()
-        with patch("tax_desktop.ctypes.windll.user32", native), patch(
-                "pywinauto.controls.hwndwrapper.HwndWrapper",
-                side_effect=[InvalidWindowHandle(12), main]):
+        wrapper = ModuleType("pywinauto.controls.hwndwrapper")
+        wrapper.InvalidWindowHandle = InvalidWindowHandle
+        wrapper.HwndWrapper = Mock(side_effect=[InvalidWindowHandle(12), main])
+        with patch.dict(sys.modules, {"pywinauto.controls.hwndwrapper": wrapper}), patch(
+                "tax_desktop.ctypes.windll", SimpleNamespace(user32=native), create=True), patch(
+                "tax_desktop.ctypes.WINFUNCTYPE", ctypes.CFUNCTYPE, create=True):
             self.assertEqual(live_windows(), [main])
 
     def test_check_zero_rebinds_and_validates_before_clicking(self):
@@ -273,3 +279,4 @@ class CompanySwitchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

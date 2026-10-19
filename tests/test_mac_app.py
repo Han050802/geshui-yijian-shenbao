@@ -220,6 +220,19 @@ def fake_app():
     app.progress_var = Mock()
     app.connection_var = Mock()
     app.pairing_var = Mock()
+    app.pairing = None
+    app.settings_server_id = "server-one"
+    app.settings_dirty = False
+    app._shown_job_errors = set()
+    app._load_settings = Mock()
+    app._render_tables = Mock()
+    app.console = Mock()
+    app.log_lines = 0
+    app.action_buttons = {task: Mock() for task in ACTION_LABELS}
+    app.setting_widgets = []
+    for name in ("stop_button", "export_button", "connect_button", "forget_button",
+                 "pairing_entry", "paste_button"):
+        setattr(app, name, Mock())
     app.closed = False
     app.generation = 1
     app.after_id = "fake-after"
@@ -228,6 +241,81 @@ def fake_app():
 
 
 class CallbackTests(unittest.TestCase):
+    def test_live_error_and_terminal_snapshot_show_reason_once(self):
+        app = fake_app()
+        reason = "Windows 桌面在开始前已不可用，任务未执行。"
+        running = job()
+        failed = {**job(status="failed"), "error": reason}
+        app._received("status", status(active=running, events=[
+            {"seq": 1, "kind": "job", "value": running},
+            {"seq": 2, "kind": "error", "value": reason},
+        ], sequence=2))
+        app._received("status", status(last=failed, events=[
+            {"seq": 3, "kind": "job", "value": failed},
+        ], sequence=3))
+        app._received("status", status(last=failed, sequence=3))
+        self.assertEqual([call.args[0] for call in app._log.call_args_list],
+                         ["任务提示：" + reason])
+        MacApp._refresh_controls(app)
+        self.assertIn("原因：" + reason, app.progress_var.set.call_args.args[0])
+        app._queue.assert_not_called()
+
+    def test_reconnect_recovers_durable_failure_without_error_events(self):
+        for terminal in ("failed", "interrupted"):
+            with self.subTest(status=terminal):
+                app = fake_app()
+                app.state = ClientState.from_record({"server_id": "server-one",
+                                                     "job_id": "job-one", "job_status": "running"})
+                reason = "执行状态无法持久化，任务未执行。"
+                failed = {**job(status=terminal), "error": reason}
+                app._received("connect", status(last=failed))
+                app._received("status", status(last=failed))
+                app.state.connected = False
+                app._received("connect", status(last=failed))
+                messages = [call.args[0] for call in app._log.call_args_list]
+                self.assertEqual(messages.count("任务提示：" + reason), 1)
+                self.assertEqual(app.state.job_status, terminal)
+                MacApp._refresh_controls(app)
+                self.assertIn(reason, app.progress_var.set.call_args.args[0])
+                app._queue.assert_not_called()
+
+    def test_controller_stop_log_error_event_and_job_reason_are_deduplicated(self):
+        app = fake_app()
+        reason = "未识别到扣缴端当前操作单位，请先登录并恢复普通窗口"
+        failed = {**job(status="failed"), "error": reason}
+        app._received("status", status(last=failed, events=[
+            {"seq": 1, "kind": "job", "value": job()},
+            {"seq": 2, "kind": "log", "value": "已停止：" + reason},
+            {"seq": 3, "kind": "error", "value": reason},
+            {"seq": 4, "kind": "job", "value": failed},
+        ], sequence=4))
+        self.assertEqual([call.args[0] for call in app._log.call_args_list],
+                         ["已停止：" + reason])
+
+    def test_same_error_for_another_job_or_cleared_log_is_shown_again(self):
+        app = fake_app()
+        reason = "任务设置或队列保存失败，任务未开始。"
+        first = {**job(status="failed"), "error": reason}
+        second = {**job(job_id="job-two", status="failed"), "error": reason}
+        app._received("status", status(last=first))
+        app.state.job_id = None
+        app._received("status", status(last=second))
+        self.assertEqual(app._log.call_count, 2)
+        app._clear_log()
+        app._received("status", status(last=second))
+        self.assertEqual(app._log.call_count, 3)
+
+    def test_immediately_failed_submit_receipt_displays_persisted_error(self):
+        app = fake_app()
+        app.state.begin_submit("request-one")
+        reason = "任务设置或队列保存失败，任务未开始。"
+        failed = {**job(status="failed"), "error": reason}
+        app._received("submit", {"job": failed})
+        self.assertIn("任务提示：" + reason, [call.args[0] for call in app._log.call_args_list])
+        MacApp._refresh_controls(app)
+        self.assertIn(reason, app.progress_var.set.call_args.args[0])
+        app._queue.assert_not_called()
+
     def test_paste_updates_code_without_connecting_or_sending(self):
         app = fake_app()
         app.root.clipboard_get.return_value = "  synthetic-connection-code  "
@@ -366,3 +454,4 @@ class ExportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

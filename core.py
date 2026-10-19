@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 import os
 import re
@@ -134,23 +135,58 @@ class StateStore:
             for record in self.records.values():
                 if not isinstance(record, dict) or record.get("state") not in ("SUBMITTING", "UNKNOWN", "SUCCESS"):
                     raise ValidationError("状态文件含未知记录，禁止继续申报")
+                steps = record.get("steps", {})
+                if not isinstance(steps, dict):
+                    raise ValidationError("后续办理状态格式错误，禁止继续")
+                for name, step in steps.items():
+                    if (name not in ("wechat", "workbench") or not isinstance(step, dict)
+                            or step.get("state") not in ("PENDING", "IN_PROGRESS", "UNKNOWN", "DONE")):
+                        raise ValidationError("后续办理状态含未知记录，禁止继续")
+                    if (name == "wechat" and step["state"] == "DONE"
+                            and (not isinstance(step.get("destination"), str) or not step["destination"].strip())):
+                        raise ValidationError("微信完成记录缺少发送对象，禁止自动重发")
 
     def get(self, company: Company) -> dict | None:
         record = self.records.get(company.key)
-        return dict(record) if record else None
+        return copy.deepcopy(record) if record else None
 
     def set(self, company: Company, state: str, reason: str = "", evidence: str = "") -> None:
         if state not in ("SUBMITTING", "UNKNOWN", "SUCCESS"):
             raise ValueError("Invalid durable state")
-        updated = dict(self.records)
-        updated[company.key] = {"state": state, "reason": reason, "evidence": evidence,
-                                "updated_at": datetime.now(timezone.utc).isoformat()}
+        updated = copy.deepcopy(self.records)
+        record = updated.get(company.key)
+        if record is None:
+            record = {"steps": {name: {"state": "PENDING"} for name in ("wechat", "workbench")}}
+        record.update(state=state, reason=reason, evidence=evidence,
+                      updated_at=datetime.now(timezone.utc).isoformat())
+        updated[company.key] = record
+        _atomic_write(self.path, json.dumps({"version": 1, "records": updated}, ensure_ascii=False, indent=2))
+        self.records = updated
+
+    def step(self, company: Company, name: str) -> dict | None:
+        record = self.get(company) or {}
+        return record.get("steps", {}).get(name)
+
+    def set_step(self, company: Company, name: str, state: str, *, destination: str = "", reason: str = "") -> None:
+        if name not in ("wechat", "workbench") or state not in ("PENDING", "IN_PROGRESS", "UNKNOWN", "DONE"):
+            raise ValueError("Invalid follow-up state")
+        if name == "wechat" and state == "DONE" and (not isinstance(destination, str) or not destination.strip()):
+            raise ValueError("Receipt destination is required")
+        updated = copy.deepcopy(self.records)
+        record = updated.get(company.key)
+        if record is None or record["state"] != "SUCCESS":
+            raise ValidationError("仅在税局成功已核验后记录后续办理状态")
+        record.setdefault("steps", {})[name] = {
+            "state": state, "destination": destination, "reason": reason,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
         _atomic_write(self.path, json.dumps({"version": 1, "records": updated}, ensure_ascii=False, indent=2))
         self.records = updated
 
 
 class Adapter(Protocol):
     def prepare(self, company: Company) -> str: ...
+    def reconcile(self, company: Company) -> str: ...
     def check_zero(self, company: Company) -> None: ...
     def calculate(self, company: Company) -> None: ...
     def check_attachments(self, company: Company) -> None: ...
@@ -190,7 +226,15 @@ class Runner:
             submitted = False
             try:
                 self._log(f"{company.name} {company.month}：核验公司身份与税款所属月")
-                prepared = self.adapter.prepare(company)
+                previous = self.store.get(company)
+                if previous:
+                    phase = "RECONCILE"
+                    self._log("存在历史提交记录：只读取税局结果，不复制工资、不算税、不再次发送")
+                    if self.adapter.reconcile(company) != "READY":
+                        raise RuntimeError("未能进入历史申报核验页面")
+                    prepared = "ALREADY_SUCCESS"
+                else:
+                    prepared = self.adapter.prepare(company)
                 if prepared not in ("READY", "ALREADY_SUCCESS"):
                     raise RuntimeError("prepare未返回明确状态")
                 if prepared != "ALREADY_SUCCESS":
@@ -213,6 +257,8 @@ class Runner:
                     if self.adapter.verify(company) is not True:
                         raise RuntimeError("已有提交记录未核验成功，禁止重复提交")
                 else:
+                    if status not in ("待申报", "未申报"):
+                        raise RuntimeError("申报状态不明确，禁止发送")
                     phase = "PERSIST_SUBMITTING"
                     self.store.set(company, "SUBMITTING", "提交前已持久化")
                     submitted = True
@@ -246,6 +292,8 @@ class Runner:
                     reason += "：" + detail.splitlines()[0]
                 if submitted:
                     reason += "；本次发送结果未确认，请核对扣缴端状态"
+                elif already_recorded:
+                    reason += "；历史发送结果仍待核验，本次未再次发送，请人工核对扣缴端"
                 else:
                     reason += "；本次尚未执行发送申报"
                 evidence = self._evidence(company, state)
@@ -273,3 +321,4 @@ def write_results(path: str | Path, results: list[dict]) -> None:
     writer.writeheader()
     writer.writerows(results)
     _atomic_write(Path(path), "\ufeff" + stream.getvalue())
+

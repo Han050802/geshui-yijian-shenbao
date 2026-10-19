@@ -18,7 +18,7 @@ from mac_smoke import (
 )
 
 PACKAGE_NAME = "个税一键申报 Mac操作端"
-ARCHIVE_STEM = "个税一键申报_Mac操作端_AppleSilicon_2026-10-19"
+ARCHIVE_STEM = "个税一键申报_Mac连接版_AppleSilicon_修复版1.0.1_2026-10-19"
 REPORT_ALLOWLIST = (
     "build-environment.json", "dependencies.txt", "smoke-report.json",
     "app-self-test.json", "protocol-tests.txt", "host-tests.txt", "mac-tests.txt",
@@ -47,7 +47,7 @@ def make_readme(environment: dict, source_commit: str) -> str:
    https://support.apple.com/guide/mac-help/mh40616/mac
 
 使用方式：Mac 操作，Windows 执行
-1. 在 Windows 电脑上解压“个税一键申报_Windows连接端_2026-10-19.zip”，
+1. 在 Windows 电脑上解压“个税一键申报_Windows完整运行包_修复版1.0.1_2026-10-19.zip”，
    保持文件夹完整，双击“启动Mac连接.cmd”，在界面点击“复制连接码”。
 2. Mac 与 Windows 需处于彼此可连接的受信网络；在 Mac 应用中点击
    “粘贴连接码”并连接。连接码包含连接凭据，请只在自己的设备间传送，
@@ -225,3 +225,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

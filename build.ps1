@@ -21,7 +21,7 @@ $env:PLAYWRIGHT_BROWSERS_PATH = '0'
 & $Python -m playwright install chromium --no-shell
 if ($LASTEXITCODE -ne 0) { throw 'Bundled Chromium download failed' }
 
-& $Python -m unittest discover -s tests -v
+& $Python -m unittest discover -s tests -v 2>&1 | Tee-Object -FilePath 'build-reports\unit-tests.txt'
 if ($LASTEXITCODE -ne 0) { throw 'Offline unit tests failed' }
 $Common = @('--noconfirm', '--clean', '--onedir', '--windowed',
     '--distpath', 'build-dist', '--workpath', 'build-work\pyinstaller',
@@ -67,3 +67,4 @@ foreach ($Pair in @(@('TaxZero', 'runtime'), @('WeChatReceipt', 'runtime-wechat'
 & $Python tools/windows_smoke.py
 if ($LASTEXITCODE -ne 0) { throw 'Packaged executable self-test failed' }
 Write-Output 'Build complete: runtime\TaxZero.exe and runtime-wechat\WeChatReceipt.exe'
+

@@ -524,17 +524,11 @@ def _choose_chat_result(candidates, group_name: str, *, exact: bool = False):
         # 联系人和文件传输助手等仍可用完整名称打开，不能用关键词模糊命中。
         matches = [entry for entry in valid if _normalized_name(entry[1]) == keyword]
     if len(matches) > 1:
-        # 兜底已指定完整名称。微信搜索和 OCR 可能把同名会话重复展示/识别，
-        # 沿用原版取首个完整同名结果，再由点击后的标题核验决定是否放行。
-        if exact:
-            return matches[0][2]
-        # 同一联系人可能同时出现在常用/最近使用与联系人分类中。
-        # 不同完整群名、同一分类下的多个同名群仍然必须停止。
-        if (all(entry[0] != "群聊" for entry in matches)
-                and len({entry[0] for entry in matches}) == len(matches)):
-            return matches[0][2]
+        # A full matching title cannot distinguish separate same-name groups or
+        # contacts. Without a stable chat id, even cross-section duplicates must
+        # be rejected; title verification after clicking cannot make them safe.
         names = " / ".join(entry[1] for entry in matches)
-        raise AmbiguousChatError(f"关键词 {group_name} 命中多个会话，请填写更完整的群名：{names}")
+        raise AmbiguousChatError(f"名称 {group_name} 命中多个会话，请消除同名歧义或更换唯一会话：{names}")
     if not matches:
         logger.info("未命中 %s；已识别搜索项：%s", group_name,
                     " / ".join(f"[{entry[0]}]{entry[1]}" for entry in candidates[:15]))
@@ -1120,3 +1114,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
