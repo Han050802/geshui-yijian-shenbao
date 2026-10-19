@@ -1,5 +1,10 @@
 @echo off
+setlocal
 cd /d "%~dp0"
+if exist "%~dp0..\runtime-wechat\WeChatReceipt.exe" (
+  start "" "%~dp0..\runtime-wechat\WeChatReceipt.exe" %*
+  exit /b 0
+)
 set "PY="
 for /f "delims=" %%I in ('where python 2^>nul') do (
   echo %%I | findstr /I "WindowsApps" >nul
@@ -37,7 +42,7 @@ if errorlevel 1 (
 )
 set "PYW=%PY:python.exe=pythonw.exe%"
 if exist "%PYW%" (
-  start "" "%PYW%" "%~dp0app.py"
+  start "" "%PYW%" "%~dp0..\wechat_launcher.py" %*
 ) else (
-  start "" "%PY%" "%~dp0app.py"
+  start "" "%PY%" "%~dp0..\wechat_launcher.py" %*
 )

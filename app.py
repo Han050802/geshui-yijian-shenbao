@@ -192,10 +192,18 @@ class Controller:
         if not app_path.is_file():
             self.log("没有找到微信自动转发程序，工作台先不点击个税。")
             return ""
-        pythonw = find_pythonw()
-        if not pythonw:
-            self.log("没有找到 Python，微信自动转发无法启动。申报已经成功，请不要再次发送申报。")
-            return ""
+        portable_wechat = BASE / "runtime-wechat" / "WeChatReceipt.exe"
+        if portable_wechat.is_file():
+            command = [str(portable_wechat)]
+        else:
+            if getattr(sys, "frozen", False):
+                self.log("没有找到微信运行组件 runtime-wechat\\WeChatReceipt.exe。请完整解压程序。申报已经成功，请不要再次发送申报。")
+                return ""
+            pythonw = find_pythonw()
+            if not pythonw:
+                self.log("没有找到 Python，微信自动转发无法启动。申报已经成功，请不要再次发送申报。")
+                return ""
+            command = [pythonw, "-X", "utf8", str(app_path)]
         data_dir = BASE / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
         company_file = data_dir / "current-company.json"
@@ -211,7 +219,7 @@ class Controller:
         self.log("正在打开微信自动转发。窗口关闭前，不点击工作台个税。")
         try:
             proc = subprocess.Popen(
-                [pythonw, "-X", "utf8", str(app_path), "--from-geshui",
+                [*command, "--from-geshui",
                  "--company-file", str(company_file), "--result-file", str(result_file)],
                 cwd=str(app_path.parent),
             )
@@ -496,14 +504,8 @@ if __name__=="__main__":
     parser.add_argument("--self-test",action="store_true",help="Offline import check; no browser or desktop input")
     args=parser.parse_args()
     if args.self_test:
-        import pywinauto
-        import rapidocr_onnxruntime
-        import playwright.sync_api
-        # Exercise model loading as well as imports, without any live capture.
-        rapidocr_onnxruntime.RapidOCR(intra_op_num_threads=2,inter_op_num_threads=2)
-        (BASE/"data").mkdir(exist_ok=True)
-        (BASE/"data"/"self_test.json").write_text(json.dumps({"imports":"ok","ocr_models":"ok"}),encoding="utf-8")
-        sys.exit(0)
+        from runtime_checks import run_self_test
+        sys.exit(run_self_test(BASE))
     if args.run:
         sys.exit(cli_run())
     gui()

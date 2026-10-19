@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit, urljoin
 
 from core import Company, ValidationError
+from runtime_checks import configure_browser_environment
 
 TAX_ID = re.compile(r"[A-Z0-9]{18}")
 CHECKS = "✓✔√"
@@ -129,6 +130,9 @@ class Workbench:
                            urlencode({"ym": month, "tab": "pending", "situation": "all_zero"}), ""))
 
     def open(self):
+        # Frozen releases carry the Playwright-matched Chromium with them.
+        # Configure this before starting its driver, which reads the environment.
+        configure_browser_environment()
         from playwright.sync_api import sync_playwright, TimeoutError as BrowserTimeout
         target = self._url()
         self.playwright = sync_playwright().start()
@@ -159,7 +163,10 @@ class Workbench:
             self.page = self.context = None
 
     def _open_target(self, target, browser_timeout, args):
-        options = {"channel": "chrome", "headless": False}
+        options = {"headless": False}
+        if not configure_browser_environment():
+            # Keep the existing source/developer launch behavior unchanged.
+            options["channel"] = "chrome"
         if args:
             options["args"] = args
         self.context = self.playwright.chromium.launch_persistent_context(
@@ -167,7 +174,7 @@ class Workbench:
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self.page.goto(target, wait_until="domcontentloaded", timeout=60000)
         if "/login" in urlsplit(self.page.url).path:
-            self.log("请在打开的 Chrome 中登录工作台；完成后程序自动继续。")
+            self.log("请在打开的浏览器中登录工作台；完成后程序自动继续。")
             deadline = time.monotonic() + 300
             while "/login" in urlsplit(self.page.url).path:
                 if self.stop():

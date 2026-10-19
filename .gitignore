@@ -15,3 +15,9 @@ data/browser_profile/
 *.log
 wechat/wxauto_logs/
 data/evidence/
+
+runtime-wechat/
+runtime.previous-*/
+runtime-wechat.previous-*/
+build-reports/
+dist-output/

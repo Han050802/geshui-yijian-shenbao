@@ -1,0 +1,56 @@
+name: Build verified Windows portable package
+
+on:
+  push:
+    branches:
+      - codex/windows-runtime-20261019
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-portable-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.12 x64
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Build and validate both portable runtimes
+        run: ./build.ps1
+      - name: Assemble complete private download package
+        run: ./build-work/venv/Scripts/python.exe tools/package_portable.py
+      - name: Upload complete download package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: geshui-windows-portable
+          path: dist-output/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload offline validation reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: geshui-build-reports
+          path: build-reports/*
+          if-no-files-found: ignore
+          retention-days: 7
