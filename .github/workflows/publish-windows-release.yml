@@ -1,0 +1,33 @@
+name: Publish verified Windows 1.1.1 download
+
+on:
+  push:
+    branches: [codex/publish-windows-1.1.1]
+    paths:
+      - .github/workflows/publish-windows-release.yml
+      - tools/publish_windows_release.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-windows-v1.1.1
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out publication script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Download, verify and publish the exact delivered package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/publish_windows_release.py
