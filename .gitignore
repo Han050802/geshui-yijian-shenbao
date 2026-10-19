@@ -21,3 +21,10 @@ runtime.previous-*/
 runtime-wechat.previous-*/
 build-reports/
 dist-output/
+
+# Pairing secrets and persistent remote job history belong to this computer.
+data/mac_bridge/
+build-dist-mac/
+build-work-mac/
+build-reports-mac/
+dist-output-mac/

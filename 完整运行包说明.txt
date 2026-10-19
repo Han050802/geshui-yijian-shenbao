@@ -1,4 +1,6 @@
-个税一键申报 — Windows 便携运行包
+个税一键申报 — Windows 连接端与完整运行包
+
+配合 Mac 使用：请先看“Mac与Windows连接说明.txt”，在 Windows 双击“启动Mac连接.cmd”并复制连接码，在配套 Mac 应用中粘贴连接。
 
 使用方法
 1. 把整个 ZIP 解压到 Windows 电脑上的普通文件夹。不要在压缩包里直接启动。

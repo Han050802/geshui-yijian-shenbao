@@ -12,7 +12,7 @@ if (-not (Test-Path -LiteralPath $Python)) {
     & $PythonExe -m venv 'build-work\venv'
     if ($LASTEXITCODE -ne 0) { throw 'Could not create isolated build environment' }
 }
-& $Python -m pip install --disable-pip-version-check -r requirements.txt -r wechat/requirements.txt 'wxauto4==41.1.7' 'winocr==0.0.15'
+& $Python -m pip install --disable-pip-version-check -r requirements.txt -r wechat/requirements.txt -r requirements-bridge.txt 'wxauto4==41.1.7' 'winocr==0.0.15'
 if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
 & $Python -m pip check
 if ($LASTEXITCODE -ne 0) { throw 'Dependency validation failed' }
@@ -34,6 +34,7 @@ New-Item -ItemType Directory -Force -Path 'build-work\specs' | Out-Null
 $MainArgs = $Common + @('--name', 'TaxZero',
     '--collect-all', 'rapidocr_onnxruntime', '--collect-all', 'onnxruntime',
     '--collect-all', 'playwright', '--collect-submodules', 'pywinauto',
+    '--collect-all', 'cryptography',
     '--hidden-import', 'pywinauto.keyboard', '--hidden-import', 'pywinauto.mouse',
     '--hidden-import', 'win32timezone', 'app.py')
 & $Python -m PyInstaller @MainArgs

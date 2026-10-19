@@ -25,6 +25,7 @@ def main() -> None:
     for name, relative in (
         ("main", "runtime/TaxZero.exe"),
         ("wechat", "runtime-wechat/WeChatReceipt.exe"),
+        ("bridge", "runtime/TaxZero.exe"),
     ):
         check = smoke_checks.get(name)
         if not isinstance(check, dict) or check.get("exit_code") != 0:
@@ -43,11 +44,25 @@ def main() -> None:
             if path.is_absolute() or ".." in path.parts:
                 raise RuntimeError("Invalid tracked path")
             files[relative] = ROOT / relative
+    # Refuse to ship changed business records or line-ending conversions.
+    # Source bytes in the ZIP must be the exact committed Git blob bytes.
+    index = subprocess.check_output(["git", "ls-files", "-s", "-z"], cwd=ROOT).decode("utf-8")
+    for record in index.split("\0"):
+        if not record:
+            continue
+        metadata, relative = record.split("\t", 1)
+        mode, expected, stage = metadata.split()
+        if mode not in ("100644", "100755") or stage != "0":
+            raise RuntimeError("Unsupported tracked file mode or merge state: " + relative)
+        content = files[relative].read_bytes()
+        actual = hashlib.sha1(b"blob " + str(len(content)).encode("ascii") + b"\0" + content).hexdigest()
+        if actual != expected:
+            raise RuntimeError("Tracked file bytes changed before packaging: " + relative)
     for directory in ("runtime", "runtime-wechat", "build-reports"):
         for path in (ROOT / directory).rglob("*"):
             if path.is_file():
                 files[path.relative_to(ROOT).as_posix()] = path
-    for required in ("runtime/TaxZero.exe", "runtime-wechat/WeChatReceipt.exe", "一键启动.cmd"):
+    for required in ("runtime/TaxZero.exe", "runtime-wechat/WeChatReceipt.exe", "一键启动.cmd", "启动Mac连接.cmd"):
         if required not in files:
             raise RuntimeError("Missing runtime entry point: " + required)
     checksums = [hashlib.sha256(path.read_bytes()).hexdigest() + "  " + relative
@@ -55,10 +70,12 @@ def main() -> None:
     build_info = {"source_commit": source_commit,
                   "built_at_utc": datetime.now(timezone.utc).isoformat(),
                   "platform": "Windows x64", "smoke_test": "passed",
+                  "companion_protocol": 1,
+                  "bridge_smoke_test": "passed",
                   "source_files_and_runtime_files": len(files)}
     destination = ROOT / "dist-output"
     destination.mkdir(exist_ok=True)
-    archive = destination / "个税一键申报_Windows完整运行包_2026-10-19.zip"
+    archive = destination / "个税一键申报_Windows连接端_2026-10-19.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for relative, path in sorted(files.items()):
             z.write(path, "个税一键申报/" + relative)

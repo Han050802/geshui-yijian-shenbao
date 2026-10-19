@@ -502,10 +502,23 @@ if __name__=="__main__":
     parser=argparse.ArgumentParser()
     parser.add_argument("--run",action="store_true",help="Run saved configuration from Power Automate")
     parser.add_argument("--self-test",action="store_true",help="Offline import check; no browser or desktop input")
+    parser.add_argument("--bridge",action="store_true",help="Open the authenticated Mac connection window on Windows")
+    parser.add_argument("--bridge-self-test",action="store_true",help="Offline bridge TLS/Tk check using a temporary fake controller")
+    parser.add_argument("--report",type=Path,help="JSON report path for --bridge-self-test")
     args=parser.parse_args()
+    if args.bridge_self_test:
+        if args.report is None:
+            parser.error("--bridge-self-test requires --report PATH")
+        from bridge_host import run_self_test
+        sys.exit(run_self_test(args.report))
+    if args.report is not None:
+        parser.error("--report is only used with --bridge-self-test")
     if args.self_test:
         from runtime_checks import run_self_test
         sys.exit(run_self_test(BASE))
+    if args.bridge:
+        from bridge_host import main
+        sys.exit(main(BASE))
     if args.run:
         sys.exit(cli_run())
     gui()

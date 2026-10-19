@@ -39,15 +39,18 @@ def main() -> int:
             env["PYTHONNOUSERSITE"] = "1"
             env["PLAYWRIGHT_BROWSERS_PATH"] = "0"
             runs = (
-                ("main", "runtime/TaxZero.exe", "self_test.json"),
-                ("wechat", "runtime-wechat/WeChatReceipt.exe", "wechat_self_test.json"),
+                ("main", "runtime/TaxZero.exe", "self_test.json", ["--self-test"]),
+                ("wechat", "runtime-wechat/WeChatReceipt.exe", "wechat_self_test.json", ["--self-test"]),
+                ("bridge", "runtime/TaxZero.exe", "bridge_self_test.json", ["--bridge-self-test"]),
             )
-            for name, relative, output in runs:
+            for name, relative, output, arguments in runs:
                 executable = base / relative
                 result_path = base / "data" / output
                 if result_path.exists():
                     raise RuntimeError("Smoke check must produce a fresh report")
-                proc = subprocess.run([str(executable), "--self-test"], cwd=str(base),
+                if name == "bridge":
+                    arguments += ["--report", str(result_path)]
+                proc = subprocess.run([str(executable), *arguments], cwd=str(base),
                                       env=env, capture_output=True, timeout=240)
                 result = json.loads(result_path.read_text(encoding="utf-8-sig")) if result_path.is_file() else {}
                 report["checks"][name] = {
@@ -57,8 +60,11 @@ def main() -> int:
                 if name == "main":
                     passed = all(result.get(k) == "ok" for k in
                                  ("imports", "ocr_models", "tkinter", "bundled_browser"))
-                else:
+                elif name == "wechat":
                     passed = result.get("ok") is True
+                else:
+                    passed = (result.get("status") == "passed" and result.get("offline") is True
+                              and result.get("real_business_executed") is False)
                 if proc.returncode or not passed:
                     raise RuntimeError(name + " packaged self-test did not pass: " + json.dumps(result))
                 print(name + ": packaged self-test passed")

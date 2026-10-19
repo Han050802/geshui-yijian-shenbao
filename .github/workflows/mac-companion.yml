@@ -1,0 +1,113 @@
+name: Build Mac operator and Windows companion
+
+on:
+  push:
+    branches:
+      - codex/mac-companion-20261019
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-companion-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - name: Preserve repository bytes before checkout
+        run: git config --global core.autocrlf false
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify checkout preserves line endings
+        run: |
+          if ((git config --get core.autocrlf) -ne 'false') {
+            throw 'core.autocrlf must be false to preserve tracked configuration and data'
+          }
+      - name: Set up Python 3.12 x64
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Build and verify the Windows runtimes
+        run: ./build.ps1
+      - name: Package the complete Windows companion
+        run: ./build-work/venv/Scripts/python.exe tools/package_portable.py
+      - name: Upload the private Windows download
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-companion
+          path: dist-output/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve Windows validation reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-companion-reports
+          path: build-reports/*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  macos:
+    # GitHub's standard macOS 15 Apple Silicon label is macos-15.
+    # macos-15-arm64 is an image name, not the documented runs-on label.
+    # https://github.com/actions/runner-images/blob/main/README.md
+    # Private repositories use the account's included/billable Actions minutes.
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - name: Preserve repository bytes before checkout
+        run: git config --global core.autocrlf false
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify checkout preserves line endings
+        run: test "$(git config --get core.autocrlf)" = false
+      - name: Set up native Python 3.12 arm64
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Build and test the relocated native Mac app
+        run: bash tools/build_mac.sh
+      - name: Package and verify DMG and structure-preserving ZIP
+        run: ./build-work-mac/venv/bin/python tools/package_mac.py
+      - name: Upload the private Mac download
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-companion
+          path: dist-output-mac/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve Mac validation reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-companion-reports
+          path: build-reports-mac/*
+          if-no-files-found: ignore
+          retention-days: 7
