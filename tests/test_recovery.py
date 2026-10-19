@@ -25,6 +25,7 @@ class RecoveryTests(unittest.TestCase):
         self.store = StateStore(self.path)
         self.events = []
         self.controller = app.Controller.__new__(app.Controller)
+        self.controller.check_wechat_mappings = MagicMock()  # Recovery is independent of first-send pairing.
         self.controller.emit = lambda kind, value: self.events.append((kind, value))
         self.controller.stop = threading.Event()
         self.controller.settings = {}

@@ -373,6 +373,8 @@ class MacApp:
         ttk.Label(outer, text="Windows 须开机、登录且桌面可用；两台电脑须在同一局域网。", foreground="#875a14").pack(anchor="w")
         ttk.Label(outer, text="关闭此窗口或断线只暂停查看，Windows 任务继续；需要停止时请点“停止”。",
                   foreground="#5a6472").pack(anchor="w", pady=(2, 9))
+        ttk.Label(outer, text="微信按Excel配对的群完整名称查找；首次请在Windows的‘微信群与Excel配对’中建表、登记群名。",
+                  foreground="#425166", wraplength=960).pack(anchor="w", pady=(0, 7))
 
         pairing_row = ttk.Frame(outer)
         pairing_row.pack(fill="x")

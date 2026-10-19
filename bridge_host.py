@@ -698,6 +698,8 @@ class BridgeWindow:
         tools = ttk.Frame(frame)
         tools.pack(fill="x")
         ttk.Button(tools, text="复制连接码", command=self.copy_code).pack(side="left")
+        self.mapping_button = ttk.Button(tools, text="微信群与Excel配对", command=self.open_mapping)
+        self.mapping_button.pack(side="left", padx=10)
         ttk.Label(tools, text=f"HTTPS 端口：{server.server_address[1]}").pack(side="right")
         self.status_text = tk.StringVar(value="连接已开启，等待 Mac 连接。")
         ttk.Label(frame, textvariable=self.status_text, font=("Microsoft YaHei UI", 11, "bold"),
@@ -713,6 +715,17 @@ class BridgeWindow:
     def copy_code(self):
         self.root.clipboard_clear()
         self.root.clipboard_append(self.code)
+
+    def open_mapping(self):
+        from tkinter import messagebox
+        if self.manager.busy or self.closing:
+            messagebox.showinfo("正在办理", "请在当前任务结束后维护微信群配对。", parent=self.root)
+            return
+        try:
+            from app import launch_wechat_mapping
+            launch_wechat_mapping()
+        except Exception as exc:
+            messagebox.showerror("微信群与Excel配对", str(exc), parent=self.root)
 
     def stop_active(self):
         self.manager.stop()
@@ -747,6 +760,7 @@ class BridgeWindow:
             else:
                 self.status_text.set("连接已开启，等待 Mac 连接。")
             self.stop_button.configure(state="normal" if job else "disabled")
+            self.mapping_button.configure(state="disabled" if job else "normal")
             if self._last_log:
                 self.detail_text.set(self._last_log[-600:])
         self.root.after(150, self.poll)
@@ -900,3 +914,4 @@ def run_self_test(report_path):
     except OSError:
         return 1
     return 0 if passed else 1
+

@@ -47,7 +47,7 @@ class OfflineTestCase(unittest.TestCase):
 
 
 class SearchSelectionTests(OfflineTestCase):
-    def assert_selection(self, rows, keyword, expected, *, exact=False, ambiguous=False):
+    def assert_selection(self, rows, keyword, expected, *, exact=False, group_only=False, ambiguous=False):
         """Exercise the same search scene through controls and OCR."""
         controls = [
             SimpleNamespace(
@@ -68,17 +68,17 @@ class SearchSelectionTests(OfflineTestCase):
         with self.subTest(source="controls"):
             if ambiguous:
                 with self.assertRaises(report.AmbiguousChatError):
-                    report._search_result_to_click(root, keyword, exact=exact)
+                    report._search_result_to_click(root, keyword, exact=exact, group_only=group_only)
             else:
-                actual = report._search_result_to_click(root, keyword, exact=exact)
+                actual = report._search_result_to_click(root, keyword, exact=exact, group_only=group_only)
                 self.assertIs(actual, None if expected is None else controls[expected])
         with self.subTest(source="ocr"):
             # OCR providers need not return their lines in visual order.
             if ambiguous:
                 with self.assertRaises(report.AmbiguousChatError):
-                    report._result_to_click(list(reversed(lines)), keyword, 60, exact=exact)
+                    report._result_to_click(list(reversed(lines)), keyword, 60, exact=exact, group_only=group_only)
             else:
-                actual = report._result_to_click(list(reversed(lines)), keyword, 60, exact=exact)
+                actual = report._result_to_click(list(reversed(lines)), keyword, 60, exact=exact, group_only=group_only)
                 self.assertIs(actual, None if expected is None else lines[expected])
 
     def test_unique_group_keyword_opens_full_group_name(self):
@@ -142,6 +142,42 @@ class SearchSelectionTests(OfflineTestCase):
         self.assert_selection([
             ("section", "群聊"), ("result", "示例 公司财务群"),
         ], "示例公司财务群", 1, exact=True)
+
+    def test_group_only_rejects_same_name_contact_and_uncategorized_result(self):
+        for section in ("联系人", "功能", "最常使用", "最近使用", "未知栏目"):
+            with self.subTest(section=section):
+                self.assert_selection([
+                    ("section", section), ("result", "示例公司财务群"),
+                ], "示例公司财务群", None, exact=True, group_only=True)
+        self.assert_selection([("result", "示例公司财务群")],
+                              "示例公司财务群", None, exact=True, group_only=True)
+
+    def test_group_only_exact_name_does_not_use_company_keyword(self):
+        self.assert_selection([
+            ("section", "群聊"), ("result", "示例公司财务群"),
+        ], "示例公司", None, exact=True, group_only=True)
+
+    def test_group_only_accepts_unique_full_group_even_with_same_name_contact(self):
+        self.assert_selection([
+            ("section", "联系人"), ("result", "示例公司财务群"),
+            ("section", "群聊"), ("result", "示例公司财务群"),
+        ], "示例公司财务群", 3, exact=True, group_only=True)
+
+    def test_group_only_rejects_duplicate_full_group_names(self):
+        self.assert_selection([
+            ("section", "群聊"), ("result", "示例公司财务群"), ("result", "示例公司财务群"),
+        ], "示例公司财务群", None, exact=True, group_only=True, ambiguous=True)
+
+    def test_group_only_preserves_internal_spaces_and_punctuation(self):
+        for expected, actual in (("A B", "AB"), ("AB", "A B"),
+                                 ("A B", "A  B"), ("A-B", "A—B")):
+            with self.subTest(expected=expected, actual=actual):
+                self.assert_selection([
+                    ("section", "群聊"), ("result", actual),
+                ], expected, None, exact=True, group_only=True)
+        self.assert_selection([
+            ("section", "群聊"), ("result", "A B"),
+        ], " A B ", 1, exact=True, group_only=True)
 
     def test_other_chat_sections_require_full_name(self):
         for section in ("联系人", "功能", "最常使用", "最近使用"):
@@ -286,6 +322,56 @@ class ChatTitleTests(OfflineTestCase):
         ):
             self.assertFalse(report._chat_title_matches(wx, 123, "示例公司财务群"))
 
+    def test_strict_title_preserves_spaces_and_allows_member_count(self):
+        for actual, expected, matches in (
+            ("A B", "AB", False), ("AB", "A B", False),
+            ("A  B", "A B", False), ("A B（ 12 ）", "A B", True),
+            ("A B旧群（12）", "A B", False), (" A B ", "A B", True),
+        ):
+            with self.subTest(actual=actual, expected=expected):
+                self.assertEqual(report._same_chat_title(actual, expected, strict=True), matches)
+
+    def test_strict_verification_reads_live_title_instead_of_cached_match(self):
+        wx = Mock()
+        wx.ChatInfo.return_value = {"chat_name": "A B"}
+        with patch.object(report, "_read_live_chat_title", return_value="AB") as read:
+            self.assertFalse(report._chat_title_matches(wx, 123, "A B", strict=True))
+            read.assert_called_once_with(123, strict=True)
+            wx.ChatInfo.assert_not_called()
+
+    def test_strict_live_title_ocr_keeps_internal_spaces(self):
+        image = Mock(width=1000)
+        with patch.dict(sys.modules, {"wxauto4.uia": SimpleNamespace(uiautomation=Mock())}), patch.object(
+            report, "_current_chat_title", return_value=""
+        ), patch.object(report, "_capture_wechat", return_value=(image, 0, 0)), patch.object(
+            report, "_ocr_lines", return_value=[{"text": "A B"}]
+        ) as ocr:
+            self.assertEqual(report._read_live_chat_title(123, strict=True), "A B")
+            ocr.assert_called_once_with(image.crop.return_value, preserve_spacing=True)
+
+
+class OCRSpacingTests(OfflineTestCase):
+    def test_strict_ocr_uses_original_line_spacing_and_legacy_keeps_behavior(self):
+        recognized = {
+            "lines": [{"text": " A B ", "words": [
+                {"text": "A", "bounding_rect": {"x": 1, "y": 2, "width": 3, "height": 4}},
+                {"text": "B", "bounding_rect": {"x": 10, "y": 2, "width": 3, "height": 4}},
+            ]}],
+        }
+        fake_ocr = SimpleNamespace(recognize_pil_sync=Mock(return_value=recognized))
+        with patch.dict(sys.modules, {"winocr": fake_ocr}):
+            self.assertEqual(report._ocr_lines(Mock(), preserve_spacing=True)[0]["text"], "A B")
+            self.assertEqual(report._ocr_lines(Mock())[0]["text"], "AB")
+
+    def test_strict_ocr_missing_original_line_does_not_invent_word_spacing(self):
+        fake_ocr = SimpleNamespace(recognize_pil_sync=Mock(return_value={
+            "lines": [{"words": [{"text": "AB", "bounding_rect": {
+                "x": 1, "y": 2, "width": 3, "height": 4,
+            }}]}],
+        }))
+        with patch.dict(sys.modules, {"winocr": fake_ocr}):
+            self.assertEqual(report._ocr_lines(Mock(), preserve_spacing=True), [])
+
 
 class OpenGroupTests(OfflineTestCase):
     def setUp(self):
@@ -313,23 +399,53 @@ class OpenGroupTests(OfflineTestCase):
 
     def test_control_match_returns_full_name_without_screen_fallback(self):
         self._open_group_by_controls.return_value = "示例公司财务群"
-        self.assertEqual(report.open_group(self.wx, "财务"), "示例公司财务群")
+        self.assertEqual(report.open_group(self.wx, "示例公司财务群", exact=True, group_only=True), "示例公司财务群")
         self._open_group_from_screen.assert_not_called()
-        self.clipboard.copy.assert_has_calls([call("财务"), call("original clipboard")])
+        self.clipboard.copy.assert_has_calls([call("示例公司财务群"), call("original clipboard")])
+        self._open_group_by_controls.assert_called_once_with(
+            self.wx, 123, "示例公司财务群", exact=True, group_only=True
+        )
 
     def test_control_ambiguity_cannot_retry_with_less_complete_ocr_results(self):
         self._open_group_by_controls.side_effect = report.AmbiguousChatError("two groups")
         self._open_group_from_screen.return_value = "示例公司财务群"
-        self.assertEqual(report.open_group(self.wx, "财务"), "")
+        self.assertEqual(report.open_group(self.wx, "示例公司财务群", exact=True, group_only=True), "")
         self._open_group_from_screen.assert_not_called()
         self.clipboard.copy.assert_called_with("original clipboard")
 
     def test_exact_mode_is_preserved_when_controls_need_ocr_fallback(self):
         self._open_group_from_screen.return_value = "文件传输助手"
         self.assertEqual(report.open_group(self.wx, "文件传输助手", exact=True), "文件传输助手")
-        self._open_group_by_controls.assert_called_once_with(self.wx, 123, "文件传输助手", exact=True)
-        self._open_group_from_screen.assert_called_once_with(self.wx, 123, "文件传输助手", exact=True)
+        self._open_group_by_controls.assert_called_once_with(self.wx, 123, "文件传输助手", exact=True, group_only=False)
+        self._open_group_from_screen.assert_called_once_with(self.wx, 123, "文件传输助手", exact=True, group_only=False)
         self.clipboard.copy.assert_called_with("original clipboard")
+
+    def test_exact_group_only_is_preserved_when_controls_need_ocr_fallback(self):
+        self._open_group_from_screen.return_value = "示例公司财务群"
+        self.assertEqual(report.open_group(
+            self.wx, "示例公司财务群", exact=True, group_only=True
+        ), "示例公司财务群")
+        for channel in (self._open_group_by_controls, self._open_group_from_screen):
+            channel.assert_called_once_with(
+                self.wx, 123, "示例公司财务群", exact=True, group_only=True
+            )
+
+
+class SearchOnlyTests(OfflineTestCase):
+    def test_search_only_opens_exact_group_without_sending_or_capturing_receipt(self):
+        wx = Mock()
+        with patch.object(report, "_create_wechat_client", return_value=wx), patch.object(
+            report, "open_group", return_value="示例公司财务群"
+        ) as open_chat:
+            self.assertEqual(report.search_group(" 示例公司财务群 "), "示例公司财务群")
+            open_chat.assert_called_once_with(wx, "示例公司财务群", exact=True, group_only=True)
+
+    def test_invalid_search_name_never_connects_to_wechat(self):
+        with patch.object(report, "_create_wechat_client") as create:
+            for value in ("", "  ", None, "请修改为目标微信群名称"):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    report.search_group(value)
+            create.assert_not_called()
 
 
 class DeliveryTests(OfflineTestCase):
@@ -343,12 +459,12 @@ class DeliveryTests(OfflineTestCase):
             self.addCleanup(guard.stop)
 
     def deliver(self):
-        return report.deliver(self.wx, "本次说明", self.image, "财务", "文件传输助手")
+        return report.deliver(self.wx, "本次说明", self.image, "示例公司财务群", "文件传输助手")
 
     def test_target_success_returns_full_destination_and_sends_once(self):
         self.open_group.return_value = "示例公司财务群"
         self.assertEqual(self.deliver(), "示例公司财务群")
-        self.open_group.assert_called_once_with(self.wx, "财务")
+        self.open_group.assert_called_once_with(self.wx, "示例公司财务群", exact=True, group_only=True)
         self.send_text_and_image.assert_called_once_with(self.wx, "本次说明", self.image)
         self.dismiss_search_box.assert_not_called()
 
@@ -356,7 +472,7 @@ class DeliveryTests(OfflineTestCase):
         self.open_group.side_effect = ["", "文件传输助手"]
         self.assertEqual(self.deliver(), "文件传输助手")
         self.assertEqual(self.open_group.call_args_list, [
-            call(self.wx, "财务"), call(self.wx, "文件传输助手", exact=True),
+            call(self.wx, "示例公司财务群", exact=True, group_only=True), call(self.wx, "文件传输助手", exact=True),
         ])
         self.dismiss_search_box.assert_called_once_with()
         self.send_text_and_image.assert_called_once_with(self.wx, "本次说明", self.image)
@@ -373,6 +489,23 @@ class DeliveryTests(OfflineTestCase):
             self.deliver()
         self.send_text_and_image.assert_not_called()
 
+    def test_excel_target_miss_stops_without_optional_fallback(self):
+        self.open_group.return_value = ""
+        with self.assertRaisesRegex(RuntimeError, "已停止发送"):
+            report.deliver(self.wx, "本次说明", self.image, "示例公司财务群", "")
+        self.open_group.assert_called_once_with(
+            self.wx, "示例公司财务群", exact=True, group_only=True
+        )
+        self.send_text_and_image.assert_not_called()
+
+    def test_optional_empty_fallback_is_valid(self):
+        report.ensure_group_names("示例公司财务群", "")
+
+    def test_explicit_fallback_must_be_valid_and_distinct(self):
+        for fallback in ("示例公司财务群", "请修改为兜底群", None):
+            with self.subTest(fallback=fallback), self.assertRaises(ValueError):
+                report.ensure_group_names("示例公司财务群", fallback)
+
     def test_fallback_search_exception_never_sends(self):
         self.open_group.side_effect = ["", RuntimeError("offline fallback failure")]
         with self.assertRaisesRegex(RuntimeError, "目标群与兜底群都无法打开"):
@@ -384,8 +517,87 @@ class DeliveryTests(OfflineTestCase):
         self.send_text_and_image.side_effect = RuntimeError("offline send failure")
         with self.assertRaisesRegex(RuntimeError, "offline send failure"):
             self.deliver()
-        self.open_group.assert_called_once_with(self.wx, "财务")
+        self.open_group.assert_called_once_with(self.wx, "示例公司财务群", exact=True, group_only=True)
         self.send_text_and_image.assert_called_once()
+
+    def test_before_send_runs_once_immediately_before_first_send(self):
+        self.open_group.return_value = "示例公司财务群"
+        sequence = []
+        self.send_text_and_image.side_effect = lambda *_args: sequence.append("send")
+        report.deliver(self.wx, "说明", self.image, "示例公司财务群", "",
+                       before_send=lambda: sequence.append("attempted"))
+        self.assertEqual(sequence, ["attempted", "send"])
+
+    def test_target_miss_never_marks_delivery_attempted(self):
+        self.open_group.return_value = ""
+        before = Mock()
+        with self.assertRaises(RuntimeError):
+            report.deliver(self.wx, "说明", self.image, "A B", "", before_send=before)
+        before.assert_not_called()
+        self.send_text_and_image.assert_not_called()
+
+    def test_similar_name_differing_only_by_space_never_reaches_send(self):
+        before = Mock()
+        self.open_group.side_effect = lambda wx, expected, **kwargs: report._choose_chat_result(
+            [("群聊", "AB", "AB")], expected, **kwargs
+        ) or ""
+        with self.assertRaisesRegex(RuntimeError, "已停止发送"):
+            report.deliver(self.wx, "说明", self.image, "A B", "", before_send=before)
+        before.assert_not_called()
+        self.send_text_and_image.assert_not_called()
+
+    def test_optional_fallback_invokes_before_send_only_once(self):
+        self.open_group.side_effect = ["", "文件传输助手"]
+        before = Mock()
+        report.deliver(self.wx, "说明", self.image, "示例公司财务群", "文件传输助手",
+                       before_send=before)
+        before.assert_called_once_with()
+        self.send_text_and_image.assert_called_once()
+
+    def test_callback_failure_prevents_send(self):
+        self.open_group.return_value = "示例公司财务群"
+        before = Mock(side_effect=RuntimeError("record failed"))
+        with self.assertRaisesRegex(RuntimeError, "record failed"):
+            report.deliver(self.wx, "说明", self.image, "示例公司财务群", "", before_send=before)
+        self.send_text_and_image.assert_not_called()
+
+    def test_sending_failure_keeps_attempt_marked_and_cannot_fallback(self):
+        self.open_group.return_value = "示例公司财务群"
+        self.send_text_and_image.side_effect = RuntimeError("partial send")
+        before = Mock()
+        with self.assertRaisesRegex(RuntimeError, "partial send"):
+            report.deliver(self.wx, "说明", self.image, "示例公司财务群", "文件传输助手",
+                           before_send=before)
+        before.assert_called_once_with()
+        self.open_group.assert_called_once()
+
+
+class ExecuteBeforeSendTests(OfflineTestCase):
+    def test_capture_failure_does_not_mark_delivery_attempted(self):
+        before = Mock()
+        with patch.object(report, "capture_screen", side_effect=RuntimeError("no tax window")):
+            with self.assertRaisesRegex(RuntimeError, "no tax window"):
+                report.execute_report("A B", "", "说明", before_send=before)
+        before.assert_not_called()
+
+    def test_client_connection_failure_does_not_mark_delivery_attempted(self):
+        before = Mock()
+        with patch.object(report, "capture_screen", return_value=Path("offline.png")), patch.object(
+            report, "_create_wechat_client", side_effect=RuntimeError("not logged in")
+        ), patch.object(report, "delete_screenshot"):
+            with self.assertRaisesRegex(RuntimeError, "not logged in"):
+                report.execute_report("A B", "", "说明", before_send=before)
+        before.assert_not_called()
+
+    def test_execute_passes_callback_to_delivery(self):
+        before, wx, image = Mock(), Mock(), Path("offline.png")
+        with patch.object(report, "capture_screen", return_value=image), patch.object(
+            report, "_create_wechat_client", return_value=wx
+        ), patch.object(report, "delete_screenshot"), patch.object(
+            report, "deliver", return_value="A B"
+        ) as deliver:
+            self.assertEqual(report.execute_report("A B", "", "说明", before_send=before), "A B")
+        deliver.assert_called_once_with(wx, "说明", image, "A B", "", before_send=before)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ DEPENDENCY_MODULES = (
     "win32ui", "win32process", "win32clipboard", "win32com.client",
     "comtypes", "comtypes.client", "comtypes.stream",
     "colorama", "httpx", "psutil", "tenacity",
+    "openpyxl", "et_xmlfile",
     "winrt.windows.foundation", "winrt.windows.foundation.collections",
     "winrt.windows.globalization", "winrt.windows.graphics.imaging",
     "winrt.windows.media.ocr", "winrt.windows.storage.streams", "winocr",
@@ -40,7 +41,7 @@ def base_dir() -> Path:
 
 def configure_source_path(base: Path) -> Path:
     source = Path(base).resolve() / "wechat"
-    for name in ("app.py", "wechat_report.py", "wechat_a11y.py"):
+    for name in ("app.py", "wechat_report.py", "wechat_a11y.py", "group_mapping.py"):
         if not (source / name).is_file():
             raise FileNotFoundError(f"微信程序文件缺失：wechat/{name}。请完整解压程序。")
     source_text = str(source)
@@ -83,6 +84,42 @@ def _empty_tk_check():
         return {"tcl": str(root.tk.call("info", "patchlevel")), "tk": str(tk.TkVersion)}
     finally:
         root.destroy()
+
+
+def _excel_mapping_check(source):
+    """Exercise the bundled Excel engine without reading business mappings."""
+    module = _load_external_module("group_mapping", source)
+    with tempfile.TemporaryDirectory(prefix="TaxZero-Excel-selftest-") as temporary:
+        store = module.GroupMappingStore(Path(temporary) / "配对自检.xlsx")
+        store.create()
+        store.upsert("离线测试公司", "离线测试财务服务群")
+        if store.resolve("离线测试公司") != "离线测试财务服务群":
+            raise RuntimeError("Excel配对写入读取不一致")
+        return {"create_write_read": "ok", "business_files_accessed": False}
+
+
+def _wechat_ui_check(source):
+    """Create the complete pairing window with all business activity disabled."""
+    with patch("tkinter.messagebox.showerror", side_effect=RuntimeError("微信配对界面模块无法加载")):
+        module = _load_external_module("app", source)
+    with patch.object(module.ReportApp, "_install_log_handler", lambda self: None):
+        window = module.ReportApp(offline_self_test=True)
+        try:
+            window.withdraw()
+            window.update_idletasks()
+            checks = {
+                "excel_search_button": bool(window.search_button.winfo_exists()),
+                "group_registration_button": bool(window.wait_group_button.winfo_exists()),
+                "existing_group_pairing_button": bool(window.pair_existing_button.winfo_exists()),
+                "mapped_group_readonly": str(window.target_entry.cget("state")) == "readonly",
+                "no_company_or_destination_loaded": not window.company_var.get() and not window.target_var.get(),
+                "no_worker_started": window.running is False,
+            }
+            if not all(checks.values()):
+                raise RuntimeError("微信Excel配对界面离线检查失败")
+            return checks
+        finally:
+            window.destroy()
 
 
 def _write_self_test_result(base: Path, result: dict) -> int:
@@ -154,12 +191,14 @@ def run_self_test(base: Path) -> int:
                         check(f"import:{name}", import_dependency)
                     check("tk_window", _empty_tk_check)
                     if source is not None:
-                        for name in ("wechat_report", "wechat_a11y"):
+                        for name in ("wechat_report", "wechat_a11y", "group_mapping"):
                             def import_source(module_name=name):
                                 module = _load_external_module(module_name, source)
                                 if Path(module.__file__).resolve() != source / f"{module_name}.py":
                                     raise RuntimeError("微信模块未从外部源码目录加载")
                             check(f"source:{name}", import_source)
+                        check("excel_mapping", lambda: _excel_mapping_check(source))
+                        check("excel_pairing_window", lambda: _wechat_ui_check(source))
             finally:
                 # wxauto4's import-time log must be closed before temp cleanup on Windows.
                 logging.shutdown()
@@ -199,3 +238,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

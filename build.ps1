@@ -46,7 +46,8 @@ $WeChatArgs = $Common + @('--name', 'WeChatReceipt', '--paths', 'wechat',
     '--hidden-import', 'pyperclip', '--hidden-import', 'tenacity', '--hidden-import', 'colorama',
     '--hidden-import', 'comtypes.stream', '--hidden-import', 'win32com.client',
     '--hidden-import', 'win32ui', '--hidden-import', 'win32timezone',
-    '--hidden-import', 'wechat_report', '--hidden-import', 'wechat_a11y')
+    '--hidden-import', 'wechat_report', '--hidden-import', 'wechat_a11y',
+    '--hidden-import', 'group_mapping', '--collect-all', 'openpyxl')
 $WeChatModules = & $Python -c "from wechat_launcher import DEPENDENCY_MODULES; print('\n'.join(DEPENDENCY_MODULES))"
 if ($LASTEXITCODE -ne 0) { throw 'Cannot read WeChat runtime dependency list' }
 foreach ($Module in $WeChatModules) { $WeChatArgs += @('--hidden-import', $Module) }

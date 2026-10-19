@@ -25,6 +25,7 @@ class AppIntegrationTests(unittest.TestCase):
         self.events = []
         # Bypass __init__ so no worker thread is started.
         self.controller = app.Controller.__new__(app.Controller)
+        self.controller.check_wechat_mappings = MagicMock()  # Excel preflight has separate integration tests.
         self.controller.emit = lambda kind, value: self.events.append((kind, value))
         self.controller.stop = threading.Event()
         self.controller.settings = {}

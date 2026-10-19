@@ -75,7 +75,7 @@ def main() -> None:
                   "source_files_and_runtime_files": len(files)}
     destination = ROOT / "dist-output"
     destination.mkdir(exist_ok=True)
-    archive = destination / "个税一键申报_Windows完整运行包_修复版1.0.1_2026-10-19.zip"
+    archive = destination / "个税一键申报_Windows完整运行包_Excel联动版1.1.0_2026-10-19.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for relative, path in sorted(files.items()):
             z.write(path, "个税一键申报/" + relative)

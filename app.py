@@ -109,6 +109,43 @@ def find_pythonw():
     return ""
 
 
+def wechat_mapping_store():
+    """Resolve the same Excel file used by the visible WeChat window."""
+    from wechat.group_mapping import GroupMappingStore, MappingError
+    config_path = BASE / "wechat" / "config.json"
+    config = {}
+    if config_path.is_file():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            if not isinstance(config, dict):
+                raise ValueError()
+        except (OSError, ValueError) as exc:
+            raise ValidationError("微信设置无法读取，请先打开‘微信群与Excel配对’检查设置。") from exc
+    value = config.get("mapping_file") or "data/微信群配对.xlsx"
+    if not isinstance(value, str):
+        raise ValidationError("微信Excel路径格式错误，请重新选择配对表。")
+    path = Path(value)
+    try:
+        return GroupMappingStore(path if path.is_absolute() else BASE / path)
+    except MappingError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+def launch_wechat_mapping():
+    """Open the visible pairing manager without running tax or sending receipts."""
+    executable = BASE / "runtime-wechat" / "WeChatReceipt.exe"
+    source = BASE / "wechat" / "app.py"
+    if not source.is_file():
+        raise ValidationError("微信程序文件缺失，请完整解压新运行包。")
+    if executable.is_file():
+        command = [str(executable)]
+    elif not getattr(sys, "frozen", False) and find_pythonw():
+        command = [find_pythonw(), "-X", "utf8", str(source)]
+    else:
+        raise ValidationError("未找到微信运行组件，请完整解压新运行包。")
+    return subprocess.Popen(command, cwd=str(source.parent))
+
+
 def read_forward_result(path, company_name, tax_label):
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
@@ -222,6 +259,33 @@ class Controller:
                        reason="微信返回明确成功结果" if sent else "可能已部分发送，请人工核对后处理")
         return sent
 
+    def check_wechat_mappings(self, companies, store):
+        """Find missing pairs before tax submission, without replaying old receipts."""
+        pending = []
+        for company in companies:
+            step = store.step(company, "wechat")
+            if step and step["state"] != "PENDING":
+                continue
+            if store.get(company) and step is None:
+                continue
+            if any(read_forward_result(path, company.name, company.month) for path in (
+                    receipt_result_path(company), BASE / "data" / "wechat-forward-result.json")):
+                continue
+            pending.append(company)
+        if not pending:
+            return
+        from wechat.group_mapping import MappingError
+        mapping = wechat_mapping_store()
+        failures = []
+        for company in pending:
+            try:
+                mapping.resolve(company.name)
+            except MappingError as exc:
+                failures.append(f"{company.name}：{exc}")
+        if failures:
+            raise ValidationError("Excel微信群配对未完成，本批次尚未开始申报。请在Windows打开‘微信群与Excel配对’修正：\n" + "\n".join(failures))
+        self.log(f"已核对 {len(pending)} 家公司的Excel微信群完整名称配对")
+
     def forward_wechat(self, company):
         """申报成功已核验之后打开微信自动转发，并等到它自己关掉。"""
         app_path = BASE / "wechat" / "app.py"
@@ -321,6 +385,8 @@ class Controller:
         data = BASE / "data"
         data.mkdir(parents=True, exist_ok=True)
         store = StateStore(data / "state.json")
+        if partial_run:
+            self.check_wechat_mappings(companies, store)
         results = []
         report = data / "last_results.csv"
         stopped = False
@@ -501,6 +567,17 @@ def gui():
     bottom=ttk.Frame(frame);bottom.pack(fill="x")
     ttk.Label(bottom,text="一键申报与测试走同一套流程。准备并检查不发送。",foreground="#666666").pack(side="left")
     ttk.Button(bottom,text="打开结果文件夹",command=lambda:open_data()).pack(side="right")
+    def open_wechat_mapping():
+        if busy["value"]:
+            messagebox.showinfo("正在办理", "请在当前批次结束后维护微信群配对。", parent=root)
+            return
+        try:
+            launch_wechat_mapping()
+        except (OSError, ValidationError) as exc:
+            messagebox.showerror("微信群与Excel配对", str(exc), parent=root)
+    mapping_button = ttk.Button(bottom, text="微信群与Excel配对", command=open_wechat_mapping)
+    mapping_button.pack(side="right", padx=8)
+    action_buttons.append(mapping_button)
     def open_data():
         (BASE/"data").mkdir(exist_ok=True)
         os.startfile(BASE/"data")

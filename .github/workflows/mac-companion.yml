@@ -5,6 +5,7 @@ on:
     branches:
       - codex/mac-companion-20261019
       - codex/audit-fixes-20261019
+      - codex/excel-wechat-20261019
   workflow_dispatch:
 
 permissions:

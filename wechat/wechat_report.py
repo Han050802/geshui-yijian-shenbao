@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """无人值守任务完成后截屏，并把说明文字与截图发到指定微信群。
 
-检索不到目标群时熔断，自动改发到兜底群，正文仍只发原来的说明。
+检索不到 Excel 配对的完整目标群时停止，不会按公司名或关键词发送。
+独立命令行可显式指定兜底会话，正文仍只发原来的说明。
 
 依赖安装：
     pip install -r requirements.txt
 
-运行前请先登录并打开微信电脑版。目标支持群名关键词，兜底请填写完整名称：
+运行前请先登录并打开微信电脑版。目标请填写 Excel 配对的完整群名，兜底请填写完整名称：
     python wechat_report.py --target "记账核对群" --fallback "文件传输助手"
 
 也可不传参数，直接修改下方 TARGET_GROUP / FALLBACK_GROUP。
@@ -17,6 +18,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import logging
+import math
 import os
 import re
 import sys
@@ -42,10 +44,10 @@ _enable_per_monitor_dpi()
 
 
 # ---------------------------------------------------------------------------
-# 运行配置：目标支持唯一的群名关键词；兜底使用完整会话名称
+# 运行配置：目标使用 Excel 配对的完整群名；兜底使用完整会话名称
 # ---------------------------------------------------------------------------
 TARGET_GROUP = os.environ.get("WECHAT_TARGET_GROUP", "请修改为目标微信群名称")
-FALLBACK_GROUP = os.environ.get("WECHAT_FALLBACK_GROUP", "请修改为兜底备用微信群名称")
+FALLBACK_GROUP = os.environ.get("WECHAT_FALLBACK_GROUP", "")
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -455,7 +457,7 @@ def _search_box_center(image) -> tuple[int, int, int] | None:
     return (left + right) // 2, (top + bottom) // 2, bottom
 
 
-def _ocr_lines(image) -> list[dict]:
+def _ocr_lines(image, *, preserve_spacing: bool = False) -> list[dict]:
     import winocr
 
     result = winocr.recognize_pil_sync(image, lang="zh-Hans")
@@ -464,7 +466,14 @@ def _ocr_lines(image) -> list[dict]:
         words = line.get("words") or []
         if not words:
             continue
-        text = "".join(str(word.get("text") or "") for word in words).replace(" ", "")
+        if preserve_spacing:
+            # OcrLine.text carries the recognizer's original spaces. Joining
+            # individual words would turn distinct names such as "A B" into
+            # "AB". If the original line is missing, fail closed.
+            text = line.get("text")
+            text = text.strip() if isinstance(text, str) else ""
+        else:
+            text = "".join(str(word.get("text") or "") for word in words).replace(" ", "")
         if not text:
             continue
         left = min(word["bounding_rect"]["x"] for word in words)
@@ -507,9 +516,11 @@ def _search_section(name: str) -> str:
     return name
 
 
-def _choose_chat_result(candidates, group_name: str, *, exact: bool = False):
-    """完整群名优先；关键词只在群聊内匹配，多个候选时不猜测。"""
-    keyword = _normalized_name(group_name)
+def _choose_chat_result(candidates, group_name: str, *, exact: bool = False,
+                        group_only: bool = False):
+    """选择唯一会话；正式目标必须完整匹配且明确位于「群聊」分类。"""
+    normalize = (lambda name: (name or "").strip()) if group_only else _normalized_name
+    keyword = normalize(group_name)
     if not keyword:
         return None
     # 微信部分版本不暴露分类标题，OCR 也可能漏读它。完整同名结果继续沿用
@@ -517,10 +528,10 @@ def _choose_chat_result(candidates, group_name: str, *, exact: bool = False):
     valid = [entry for entry in candidates
              if entry[0] not in _SKIP_SECTIONS and not entry[0].startswith("查看全部")]
     groups = [entry for entry in valid if entry[0] == "群聊"]
-    matches = [entry for entry in groups if _normalized_name(entry[1]) == keyword]
-    if not matches and not exact:
+    matches = [entry for entry in groups if normalize(entry[1]) == keyword]
+    if not matches and not exact and not group_only:
         matches = [entry for entry in groups if keyword in _normalized_name(entry[1])]
-    if not matches:
+    if not matches and not group_only:
         # 联系人和文件传输助手等仍可用完整名称打开，不能用关键词模糊命中。
         matches = [entry for entry in valid if _normalized_name(entry[1]) == keyword]
     if len(matches) > 1:
@@ -535,7 +546,8 @@ def _choose_chat_result(candidates, group_name: str, *, exact: bool = False):
     return matches[0][2] if matches else None
 
 
-def _search_result_to_click(root, group_name: str, *, exact: bool = False):
+def _search_result_to_click(root, group_name: str, *, exact: bool = False,
+                            group_only: bool = False):
     """从控件搜索结果中选择唯一群聊，兜底可限定完整名称。"""
     search_list = root.ListControl(AutomationId="search_list", searchDepth=40)
     if not search_list.Exists(1.2):
@@ -551,11 +563,12 @@ def _search_result_to_click(root, group_name: str, *, exact: bool = False):
         if class_name != "mmui::SearchContentCellView":
             continue
         candidates.append((section, name, item))
-    return _choose_chat_result(candidates, group_name, exact=exact)
+    return _choose_chat_result(candidates, group_name, exact=exact, group_only=group_only)
 
 
 def _result_to_click(lines: list[dict], group_name: str, search_bottom: int,
-                     *, exact: bool = False, search_right: int | None = None) -> dict | None:
+                     *, exact: bool = False, search_right: int | None = None,
+                     group_only: bool = False) -> dict | None:
     """只从左侧搜索结果的会话分类中选取名称，不匹配聊天记录。"""
     section = ""
     candidates = []
@@ -569,21 +582,28 @@ def _result_to_click(lines: list[dict], group_name: str, search_bottom: int,
             section = "聊天记录" if text.startswith("查看全部") else text
             continue
         candidates.append((section, line["text"], line))
-    return _choose_chat_result(candidates, group_name, exact=exact)
+    return _choose_chat_result(candidates, group_name, exact=exact, group_only=group_only)
 
 
-def _same_chat_title(actual: str, expected: str) -> bool:
-    actual = _normalized_name(_clean_chat_title(actual))
-    expected = _normalized_name(_clean_chat_title(expected))
+def _same_chat_title(actual: str, expected: str, *, strict: bool = False) -> bool:
+    normalize = (lambda value: value.strip()) if strict else _normalized_name
+    actual = normalize(_clean_chat_title(actual))
+    expected = normalize(_clean_chat_title(expected))
     if not actual or not expected:
         return False
     if actual == expected:
         return True
     # 群聊标题可能追加人数；不允许把「旧群」等真实名称后缀当成装饰。
-    return re.sub(r"[（(]\d+[）)]$", "", actual) == expected
+    suffix = r"\s*[（(]\s*\d+\s*[）)]$" if strict else r"[（(]\d+[）)]$"
+    return re.sub(suffix, "", actual) == expected
 
 
-def _chat_title_matches(wx, hwnd: int, group_name: str) -> bool:
+def _chat_title_matches(wx, hwnd: int, group_name: str, *, strict: bool = False) -> bool:
+    if strict:
+        # New Excel destinations require a fresh title, not ChatInfo's cached
+        # previous conversation, and internal whitespace is meaningful.
+        actual = _read_live_chat_title(hwnd, strict=True)
+        return _same_chat_title(actual, group_name, strict=True)
     actual = _safe_chat_name(wx)
     if _same_chat_title(actual, group_name):
         return True
@@ -600,10 +620,11 @@ def _chat_title_matches(wx, hwnd: int, group_name: str) -> bool:
     return matched
 
 
-def _wait_for_chat_title(wx, hwnd: int, selected_name: str) -> bool:
+def _wait_for_chat_title(wx, hwnd: int, selected_name: str, *, strict: bool = False) -> bool:
     deadline = time.monotonic() + 3.0
     while True:
-        if _chat_title_matches(wx, hwnd, selected_name):
+        kwargs = {"strict": True} if strict else {}
+        if _chat_title_matches(wx, hwnd, selected_name, **kwargs):
             return True
         if time.monotonic() >= deadline:
             logger.warning("点击后未确认进入会话：%s", selected_name)
@@ -611,7 +632,8 @@ def _wait_for_chat_title(wx, hwnd: int, selected_name: str) -> bool:
         time.sleep(0.25)
 
 
-def _open_group_by_controls(wx, hwnd: int, group_name: str, *, exact: bool = False) -> str:
+def _open_group_by_controls(wx, hwnd: int, group_name: str, *, exact: bool = False,
+                            group_only: bool = False) -> str:
     """控件树完整时搜索关键词，点击唯一结果并核对完整会话名称。"""
     try:
         from wxauto4.uia import uiautomation as auto
@@ -635,9 +657,10 @@ def _open_group_by_controls(wx, hwnd: int, group_name: str, *, exact: bool = Fal
             typed = (search_edit.GetValuePattern().Value or "").strip()
         except Exception:
             typed = ""
-    if _normalized_name(typed) != _normalized_name(group_name):
+    normalize = (lambda name: name.strip()) if group_only else _normalized_name
+    if normalize(typed) != normalize(group_name):
         return ""
-    result = _search_result_to_click(root, group_name, exact=exact)
+    result = _search_result_to_click(root, group_name, exact=exact, group_only=group_only)
     if result is None:
         return ""
     selected_name = (result.Name or "").strip()
@@ -645,12 +668,14 @@ def _open_group_by_controls(wx, hwnd: int, group_name: str, *, exact: bool = Fal
         return ""
     result.Click()
     time.sleep(0.45)
-    opened = _wait_for_chat_title(wx, hwnd, selected_name)
+    title_kwargs = {"strict": True} if group_only else {}
+    opened = _wait_for_chat_title(wx, hwnd, selected_name, **title_kwargs)
     logger.info("搜索关键词 %s -> 命中 %s -> 打开=%s", group_name, selected_name, opened)
     return selected_name if opened else ""
 
 
-def _open_group_from_screen(wx, hwnd: int, group_name: str, *, exact: bool = False) -> str:
+def _open_group_from_screen(wx, hwnd: int, group_name: str, *, exact: bool = False,
+                            group_only: bool = False) -> str:
     """控件树为空时，从搜索栏下方识别唯一群名并点击。"""
     if not _show_wechat(hwnd):
         logger.info("微信没有回到前台，取消点击搜索栏")
@@ -676,8 +701,9 @@ def _open_group_from_screen(wx, hwnd: int, group_name: str, *, exact: bool = Fal
         return ""
     image, origin_x, origin_y = _capture_wechat(hwnd)
     # 按真实搜索栏边界过滤文字起点，不截断延伸到右边的长群名。
-    result = _result_to_click(_ocr_lines(image), group_name, search_bottom,
-                             exact=exact, search_right=search_right)
+    ocr_kwargs = {"preserve_spacing": True} if group_only else {}
+    result = _result_to_click(_ocr_lines(image, **ocr_kwargs), group_name, search_bottom,
+                             exact=exact, search_right=search_right, group_only=group_only)
     if result is None:
         logger.info("搜索结果里没有可唯一确定的会话：%s", group_name)
         dismiss_search_box()
@@ -687,14 +713,16 @@ def _open_group_from_screen(wx, hwnd: int, group_name: str, *, exact: bool = Fal
     click_y = origin_y + int((result["y"] + result["bottom"]) / 2)
     _click_screen(click_x, click_y)
     time.sleep(0.55)
-    opened = _wait_for_chat_title(wx, hwnd, selected_name)
+    title_kwargs = {"strict": True} if group_only else {}
+    opened = _wait_for_chat_title(wx, hwnd, selected_name, **title_kwargs)
     logger.info("搜索关键词 %s -> 命中 %s -> 打开=%s", group_name, selected_name, opened)
     if not opened:
         dismiss_search_box()
     return selected_name if opened else ""
 
 
-def open_group(wx, group_name: str, *, exact: bool = False) -> str:
+def open_group(wx, group_name: str, *, exact: bool = False,
+               group_only: bool = False) -> str:
     """搜索并核对会话，成功返回完整名称，失败返回空字符串。"""
     found = find_wechat_main_window()
     if found is None:
@@ -725,12 +753,12 @@ def open_group(wx, group_name: str, *, exact: bool = False) -> str:
     try:
         pyperclip.copy(group_name)
         time.sleep(0.05)
-        opened = _open_group_by_controls(wx, hwnd, group_name, exact=exact)
+        opened = _open_group_by_controls(wx, hwnd, group_name, exact=exact, group_only=group_only)
         if opened:
             logger.info("已通过控件打开 %s", opened)
             return opened
         dismiss_search_box()
-        return _open_group_from_screen(wx, hwnd, group_name, exact=exact)
+        return _open_group_from_screen(wx, hwnd, group_name, exact=exact, group_only=group_only)
     except AmbiguousChatError as exc:
         logger.warning("%s", exc)
         dismiss_search_box()
@@ -747,18 +775,129 @@ def open_group(wx, group_name: str, *, exact: bool = False) -> str:
                 pass
 
 
-def deliver(wx, text: str, image_path: Path, target_group: str, fallback_group: str) -> str:
-    """先检索目标群；失败或异常则熔断，改发兜底群。返回实际发送到的群名。"""
+def _create_wechat_client():
+    """连接已登录的微信；供发送与只搜索入口共用。"""
+    configure_wxauto()
+    found = find_wechat_main_window()
+    if found is not None:
+        ensure_wechat_controls(found[0])
+    try:
+        return load_wechat_class()()
+    except Exception as exc:
+        if "未找到已登录的客户端主窗口" in str(exc):
+            version = wechat_version(found[1]) if found else ""
+            raise WeChatClientError(
+                describe_blocked_wechat(version), can_restart=found is not None
+            ) from exc
+        raise
+
+
+def _require_group_name(group_name: str) -> str:
+    if not isinstance(group_name, str):
+        raise ValueError("请填写 Excel 配对的微信群完整名称。")
+    name = group_name.strip()
+    if not name or name.startswith("请修改为"):
+        raise ValueError("请填写 Excel 配对的微信群完整名称。")
+    return name
+
+
+def search_group(group_name: str) -> str:
+    """复制完整群名并打开唯一群聊；不截取业务回执、不发送消息。"""
+    group_name = _require_group_name(group_name)
+    wx = _create_wechat_client()
+    time.sleep(SEARCH_RENDER_SECONDS)
+    return open_group(wx, group_name, exact=True, group_only=True)
+
+
+class GroupWaitCancelled(RuntimeError):
+    """用户取消等待微信群出现，调用方不得写入 Excel。"""
+
+
+def _read_live_chat_title(hwnd: int, *, strict: bool = False) -> str:
+    """只读取当前可见会话标题，不使用可能缓存旧名称的 ChatInfo。"""
+    try:
+        from wxauto4.uia import uiautomation as auto
+
+        title = _current_chat_title(auto.ControlFromHandle(hwnd))
+        if title:
+            return title
+    except Exception:
+        logger.debug("无法从控件读取实时会话标题，尝试可见标题", exc_info=True)
+    image, _left, _top = _capture_wechat(hwnd)
+    header = image.crop((int(image.width * 0.36), 28, int(image.width * 0.78), 92))
+    kwargs = {"preserve_spacing": True} if strict else {}
+    separator = "\n" if strict else ""
+    return separator.join(line["text"] for line in _ocr_lines(header, **kwargs))
+
+
+def wait_for_group(group_name: str, stop_event, on_status=None, timeout=600) -> str:
+    """等待用户打开/建好指定群后核验；轮询期间不抢焦点、不操作搜索框。
+
+    微信没有稳定的创建事件接口，因此只确认该完整名称群已出现，且搜索
+    结果能唯一证明它是群聊。返回后由调用方保存公司与群名的 Excel 配对。
+    """
+    group_name = _require_group_name(group_name)
+    timeout = float(timeout)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("等待时长必须是正数。")
+    deadline = time.monotonic() + timeout
+    last_status = None
+
+    def status(message):
+        nonlocal last_status
+        if message != last_status:
+            last_status = message
+            if callable(on_status):
+                on_status(message)
+
+    def check_cancelled():
+        if stop_event.is_set():
+            raise GroupWaitCancelled("已取消等待，未登记微信群。")
+
+    status(f"请在微信创建并命名或打开「{group_name}」，正在等待群出现。")
+    while True:
+        check_cancelled()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"等待微信群「{group_name}」超时，未登记到 Excel。")
+        title = ""
+        try:
+            found = find_wechat_main_window()
+            if found and ctypes.windll.user32.GetForegroundWindow() == found[0]:
+                title = _read_live_chat_title(found[0], strict=True)
+        except Exception:
+            logger.debug("等待期间暂时无法读取微信标题", exc_info=True)
+        if _same_chat_title(title, group_name, strict=True):
+            check_cancelled()
+            status(f"已看到「{group_name}」，正在核对完整群名与群聊身份。")
+            opened = search_group(group_name)
+            check_cancelled()
+            if not opened:
+                raise RuntimeError(
+                    f"未能唯一确认微信群「{group_name}」，未登记到 Excel。"
+                    "请检查完整群名、同名群及微信搜索结果后重试。"
+                )
+            return opened
+        stop_event.wait(min(0.5, max(0, deadline - time.monotonic())))
+
+
+def deliver(wx, text: str, image_path: Path, target_group: str, fallback_group: str,
+            *, before_send=None) -> str:
+    """按完整名称检索目标群；仅独立调用显式提供兜底时才允许降级。"""
     opened = ""
     try:
-        opened = open_group(wx, target_group)
+        opened = open_group(wx, target_group, exact=True, group_only=True)
     except Exception:
-        logger.exception("检索目标群时发生异常，准备降级")
+        logger.exception("检索目标群时发生异常")
         opened = ""
 
     if opened:
+        if before_send is not None:
+            before_send()
         send_text_and_image(wx, text, image_path)
         return opened
+
+    if not fallback_group.strip():
+        raise RuntimeError(f"未找到唯一的目标微信群「{target_group}」，已停止发送。请核对 Excel 配对的完整群名。")
 
     logger.warning("未检索到目标群 %s，切换兜底群 %s", target_group, fallback_group)
     dismiss_search_box()
@@ -772,6 +911,8 @@ def deliver(wx, text: str, image_path: Path, target_group: str, fallback_group: 
     if not fallback_opened:
         raise RuntimeError(f"目标群与兜底群都无法打开: {target_group} / {fallback_group}")
 
+    if before_send is not None:
+        before_send()
     send_text_and_image(wx, text, image_path)
     return fallback_opened
 
@@ -819,18 +960,19 @@ def run_work() -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="任务完成后截屏并发送到微信群，失败时降级到兜底群")
-    parser.add_argument("--target", default=TARGET_GROUP, help="目标微信群完整名称或唯一关键词")
-    parser.add_argument("--fallback", default=FALLBACK_GROUP, help="检索失败时的兜底会话完整名称")
+    parser = argparse.ArgumentParser(description="任务完成后截屏，按完整名称匹配并发送到微信群")
+    parser.add_argument("--target", default=TARGET_GROUP, help="Excel 配对的目标微信群完整名称")
+    parser.add_argument("--fallback", default=FALLBACK_GROUP,
+                        help="可选，仅人工显式指定的兜底会话完整名称；默认不转发兜底")
     parser.add_argument("--message", default="", help="附加说明；为空时使用任务返回的说明")
     return parser.parse_args()
 
 
 def ensure_group_names(target_group: str, fallback_group: str) -> None:
-    invalid = [name for name in (target_group, fallback_group) if (not name.strip()) or name.startswith("请修改为")]
-    if invalid:
-        raise ValueError("请填写目标群的完整名称或唯一关键词，并填写兜底会话的完整名称。")
-    if target_group.strip() == fallback_group.strip():
+    _require_group_name(target_group)
+    if not isinstance(fallback_group, str) or fallback_group.strip().startswith("请修改为"):
+        raise ValueError("如需兜底，请填写人工指定的兜底会话完整名称；否则留空。")
+    if fallback_group.strip() and target_group.strip() == fallback_group.strip():
         raise ValueError("目标群和兜底群不能是同一个名称，否则无法区分降级。")
 
 
@@ -1053,6 +1195,7 @@ def execute_report(
     summary: str,
     screenshot_dir: Path | None = None,
     status: str = "成功",
+    *, before_send=None,
 ) -> str:
     """截屏并发送。临时图片在发送结束后删除。返回实际发送到的群名。"""
     del screenshot_dir, status
@@ -1062,20 +1205,10 @@ def execute_report(
     image_path = capture_screen()
     try:
         text = build_message(summary)
-        configure_wxauto()
-        found = find_wechat_main_window()
-        if found is not None:
-            ensure_wechat_controls(found[0])
-        try:
-            wx = load_wechat_class()()
-        except Exception as exc:
-            # wxauto 把“控件树为空”也报成找不到主窗口。这里换成可操作的说明。
-            if "未找到已登录的客户端主窗口" in str(exc):
-                version = wechat_version(found[1]) if found else ""
-                raise WeChatClientError(describe_blocked_wechat(version), can_restart=found is not None) from exc
-            raise
+        wx = _create_wechat_client()
         time.sleep(SEARCH_RENDER_SECONDS)
-        sent_to = deliver(wx, text, image_path, target_group, fallback_group)
+        sent_to = deliver(wx, text, image_path, target_group, fallback_group,
+                          before_send=before_send)
         logger.info("已发送到：%s", sent_to)
         return sent_to
     finally:
